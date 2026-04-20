@@ -1,2 +1,26 @@
-idf_component_register(SRCS "main.c"
-                    INCLUDE_DIRS ".")
+idf_component_register(
+    SRCS
+        "main.c"
+        "periph_i2c.c"
+        "periph_adc.c"
+        "periph_wf5803f.c"
+        "periph_pwm.c"
+        "ctrl_ntc.c"
+        "ctrl_pid.c"
+        "ctrl_failsafe.c"
+        "comm_protocol.c"
+        "comm_command.c"
+        "comm_udp.c"
+        "sys_ota.c"
+    INCLUDE_DIRS
+        "."
+    REQUIRES
+        driver
+        esp_event
+        esp_netif
+        esp_wifi
+        esp_timer
+        nvs_flash
+        app_update
+        esp_https_ota
+)

@@ -12,5 +12,7 @@
     "--background-index",
     "--query-driver=**",
     "--compile-commands-dir=e:\\program_C\\ESP32\\sample_project\\build"
-  ]
+  ],
+  "idf.flashType": "JTAG",
+  "idf.portWin": "COM6"
 }
