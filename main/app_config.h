@@ -12,10 +12,10 @@
 
 // ======================== Feature Switches ========================
 // 功能总开关：采集与上传使用同一组使能，避免“采了但没发”或“发了无数据”。
-#define FEATURE_NTC_CH0_ENABLE            0 // NTC 通道 0 使能，ADC_CH1
-#define FEATURE_NTC_CH1_ENABLE            0 // NTC 通道 1 使能, ADC_CH2
-#define FEATURE_NTC_CH2_ENABLE            0 // NTC 通道 2 使能, ADC_CH3
-#define FEATURE_NTC_CH3_ENABLE            0 // NTC 通道 3 使能
+#define FEATURE_NTC_CH0_ENABLE            1 // NTC 通道 0 使能，ADC_CH1，下侧分压测温
+#define FEATURE_NTC_CH1_ENABLE            1 // NTC 通道 1 使能, ADC_CH2
+#define FEATURE_NTC_CH2_ENABLE            1 // NTC 通道 2 使能, ADC_CH3
+#define FEATURE_NTC_CH3_ENABLE            1 // NTC 通道 3 使能
 #define FEATURE_WF5803F_ENABLE            1 // WF5803F 功能使能
 #define FEATURE_VOLTAGE_MONITOR_ENABLE    1 // 监测电压并上报，必要时触发保护
 #define FEATURE_UPLOAD_ENABLE             0 // 0: 仅串口日志；1: 同时 UDP 上传
@@ -34,10 +34,10 @@
 
 // PID 默认参数（上电初始值，可被运行时命令覆盖）。
 #define APP_DEFAULT_SETPOINT_C            45.0f // 初始目标温度（℃）
-#define APP_PID_KP_DEFAULT                6.0f  // 比例增益
-#define APP_PID_KI_DEFAULT                0.6f  // 积分增益
-#define APP_PID_KD_DEFAULT                0.1f  // 微分增益
-#define APP_PID_ILIMIT_DEFAULT            80.0f // 积分限幅（%），防止积分风暴
+#define APP_PID_KP_DEFAULT                0.0f  // 比例增益
+#define APP_PID_KI_DEFAULT                0.0f  // 积分增益
+#define APP_PID_KD_DEFAULT                0.0f  // 微分增益
+#define APP_PID_ILIMIT_DEFAULT            100.0f // 积分限幅（%），防止积分风暴
 
 // ======================== I2C and Peripheral Pins ================
 // I2C 总线定义：对应硬件图纸 IO11/IO12，速率 400kHz。
