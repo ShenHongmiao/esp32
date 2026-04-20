@@ -52,7 +52,7 @@ typedef struct {
 	float process_temp_c;
 	float requested_setpoint_c;
 	float effective_setpoint_c;
-	float pwm_percent;
+	float pwm_on_ms;
 
     // 上位机心跳时间戳与 OTA 请求标志。
 	uint32_t last_heartbeat_ms;
@@ -87,7 +87,7 @@ static void runtime_init(void) {
 	s_state.effective_setpoint_c = APP_DEFAULT_SETPOINT_C;
 	s_state.last_heartbeat_ms = app_now_ms();
 	s_state.process_temp_c = APP_DEFAULT_SETPOINT_C;
-	s_state.pwm_percent = 0.0f;
+	s_state.pwm_on_ms = 0.0f;
 }
 
 static float select_process_temperature(const app_runtime_t *sample) {
@@ -212,7 +212,10 @@ static void apply_command(const comm_command_t *cmd) {
 			s_pid.kp = cmd->value;
 			break;
 		case COMM_COMMAND_KI:
-			s_pid.ki = cmd->value;
+			if (s_pid.ki != cmd->value) {
+				s_pid.ki = cmd->value;
+				s_pid.integral = 0.0f;
+			}
 			break;
 		case COMM_COMMAND_KD:
 			s_pid.kd = cmd->value;
@@ -244,6 +247,21 @@ static void control_task(void *arg) {
 	(void)arg;
 	// 离散 PID 的采样周期（秒）。
 	const float dt_s = APP_CONTROL_PERIOD_MS / 1000.0f;
+	const TickType_t control_period_ticks =
+		(pdMS_TO_TICKS(APP_CONTROL_PERIOD_MS) > 0) ? pdMS_TO_TICKS(APP_CONTROL_PERIOD_MS) : 1;
+	// 等价于 osKernelGetTickCount + osDelayUntil，确保控制循环严格对齐固定周期。
+	TickType_t sys_tick_count_ctrl = xTaskGetTickCount();
+
+	// 任务启动后再加载运行 PID 参数：上电阶段保持 0 输出，进入控制任务后才启用调参值。
+	xSemaphoreTake(s_state_lock, portMAX_DELAY);
+	ctrl_pid_set_gains(&s_pid, APP_PID_TASK_START_KP, APP_PID_TASK_START_KI, APP_PID_TASK_START_KD);
+	ctrl_pid_reset(&s_pid);
+	xSemaphoreGive(s_state_lock);
+	ESP_LOGI(TAG,
+			 "pid task start gains: kp=%.2f ki=%.2f kd=%.2f",
+			 APP_PID_TASK_START_KP,
+			 APP_PID_TASK_START_KI,
+			 APP_PID_TASK_START_KD);
 
 	while (1) {
 		// 1) 采样所有外设数据。
@@ -283,33 +301,33 @@ static void control_task(void *arg) {
 			ctrl_failsafe_effective_setpoint(&s_failsafe, now_ms, last_hb, requested_sp);
 
 		// 4) 温度有效时执行 PID；否则直接关断 PWM。
-		float pwm_output = 0.0f;
+		float pwm_on_ms = 0.0f;
 		if (isfinite(process_temp)) {
 			xSemaphoreTake(s_state_lock, portMAX_DELAY);
 			ctrl_pid_set_setpoint(&s_pid, effective_sp);
-			pwm_output = ctrl_pid_update(&s_pid, process_temp, dt_s, NULL);
+			pwm_on_ms = ctrl_pid_update(&s_pid, process_temp, dt_s, NULL);
 
 			// 欠压或 OTA 挂起期间，强制输出为 0。
 			if (s_state.undervoltage || s_state.ota_pending) {
-				pwm_output = 0.0f;
+				pwm_on_ms = 0.0f;
 			}
 
 			s_state.process_temp_c = process_temp;
 			s_state.effective_setpoint_c = effective_sp;
-			s_state.pwm_percent = pwm_output;
+			s_state.pwm_on_ms = pwm_on_ms;
 			xSemaphoreGive(s_state_lock);
 		} else {
 			periph_pwm_force_off();
 			xSemaphoreTake(s_state_lock, portMAX_DELAY);
-			s_state.pwm_percent = 0.0f;
+			s_state.pwm_on_ms = 0.0f;
 			xSemaphoreGive(s_state_lock);
-			vTaskDelay(pdMS_TO_TICKS(APP_CONTROL_PERIOD_MS));
+			vTaskDelayUntil(&sys_tick_count_ctrl, control_period_ticks);
 			continue;
 		}
 
 		// 5) 将控制输出写入 PWM 驱动。
-		periph_pwm_set_percent(pwm_output);
-		vTaskDelay(pdMS_TO_TICKS(APP_CONTROL_PERIOD_MS));
+		periph_pwm_set_on_time_ms(pwm_on_ms);
+		vTaskDelayUntil(&sys_tick_count_ctrl, control_period_ticks);
 	}
 }
 
@@ -340,7 +358,7 @@ static void telemetry_task(void *arg) {
 
 		// USB 日志实时输出。
 		ESP_LOGI(TAG,
-				 "T0=%.2f V0=%.3f T1=%.2f V1=%.3f T2=%.2f V2=%.3f T3=%.2f V3=%.3f WF_T=%.2f WF_P=%.2f V=%.2f PWM=%.1f SP=%.2f SAFE=%d",
+				 "T0=%.2f V0=%.3f T1=%.2f V1=%.3f T2=%.2f V2=%.3f T3=%.2f V3=%.3f WF_T=%.2f WF_P=%.2f V=%.2f PWMms=%.1f SP=%.2f SAFE=%d",
 				 snapshot.ntc_temp_c[0],
 				 snapshot.ntc_voltage_v[0],
 				 snapshot.ntc_temp_c[1],
@@ -352,7 +370,7 @@ static void telemetry_task(void *arg) {
 				 snapshot.wf_temp_c,
 				 snapshot.wf_pressure_kpa,
 				 snapshot.supply_voltage_v,
-				 snapshot.pwm_percent,
+				 snapshot.pwm_on_ms,
 				 snapshot.effective_setpoint_c,
 				 s_failsafe.safe_mode);
 
@@ -480,11 +498,12 @@ void app_main(void) {
 
 	// 3) 初始化运行态与控制参数。
 	runtime_init();
+	// 上电固定为 0/0/0，确保烧录与启动阶段不输出控制量。
 	ctrl_pid_init(
 		&s_pid,
-		APP_PID_KP_DEFAULT,
-		APP_PID_KI_DEFAULT,
-		APP_PID_KD_DEFAULT,
+		0.0f,
+		0.0f,
+		0.0f,
 		APP_DEFAULT_SETPOINT_C);
 	ctrl_pid_set_integral_limit(&s_pid, APP_PID_ILIMIT_DEFAULT);
 	ctrl_failsafe_init(&s_failsafe, APP_HEARTBEAT_TIMEOUT_MS, APP_SAFE_SETPOINT_C);
@@ -504,8 +523,8 @@ void app_main(void) {
 #endif
 
 	// 6) 启动各业务任务。
-	xTaskCreate(control_task, "control_task", 4096, NULL, 8, NULL);
-	xTaskCreate(telemetry_task, "telemetry_task", 4096, NULL, 5, NULL);
+	xTaskCreate(control_task, "control_task", 4096, NULL, 8, NULL);//控制任务优先级最高，确保及时响应。
+	xTaskCreate(telemetry_task, "telemetry_task", 4096, NULL, 5, NULL);//遥测任务优先级适中，保证稳定输出同时不干扰控制。
 #if FEATURE_WIRELESS_ENABLE
 	xTaskCreate(udp_command_task, "udp_cmd_task", 4096, NULL, 6, NULL);
 #endif

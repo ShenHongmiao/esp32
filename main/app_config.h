@@ -6,8 +6,8 @@
 /*
  * 工程统一配置文件
  * 说明：
- * 1) 本文件仅放“可调参数/引脚定义/功能开关”，不放业务逻辑。
- * 2) 业务代码尽量只依赖这里的宏，便于后续调参与迁移硬件。
+ * 1.本文件仅放“可调参数/引脚定义/功能开关”，不放业务逻辑。
+ * 2.业务代码尽量只依赖这里的宏，便于后续调参与迁移硬件。
  */
 
 // ======================== Feature Switches ========================
@@ -24,20 +24,31 @@
 
 // ======================== Control Loop ============================
 // 控制任务周期（毫秒）：越小响应越快，但 CPU 占用和噪声敏感度越高。
-#define APP_CONTROL_PERIOD_MS             100
+#define APP_CONTROL_PERIOD_MS             50
 // 遥测上报周期（毫秒）：用于串口日志和 UDP 上传节流。
-#define APP_TELEMETRY_PERIOD_MS           500
+#define APP_TELEMETRY_PERIOD_MS           200
 // 心跳超时（毫秒）：超过该时间未收到上位机命令则进入安全模式。
 #define APP_HEARTBEAT_TIMEOUT_MS          5000
 // 安全模式目标温度（摄氏度）：失联时回退到该设定。
-#define APP_SAFE_SETPOINT_C               35.0f
+#define APP_SAFE_SETPOINT_C               30.0f
 
 // PID 默认参数（上电初始值，可被运行时命令覆盖）。
-#define APP_DEFAULT_SETPOINT_C            45.0f // 初始目标温度（℃）
-#define APP_PID_KP_DEFAULT                0.0f  // 比例增益
-#define APP_PID_KI_DEFAULT                0.0f  // 积分增益
-#define APP_PID_KD_DEFAULT                0.0f  // 微分增益
-#define APP_PID_ILIMIT_DEFAULT            100.0f // 积分限幅（%），防止积分风暴
+#define APP_DEFAULT_SETPOINT_C            30.0f // 初始目标温度（℃）
+#define APP_PID_KP_DEFAULT                0.0f  // 固定默认值：上电阶段 Kp 必须为 0（勿改）
+#define APP_PID_KI_DEFAULT                0.0f  // 固定默认值：上电阶段 Ki 必须为 0（勿改）
+#define APP_PID_KD_DEFAULT                0.0f  // 固定默认值：上电阶段 Kd 必须为 0（勿改）
+// PID 输出限幅（ms）：控制量映射到 0~1000ms 导通时间，超过该范围会被 clamp 限幅。
+#define APP_PID_OUTPUT_MIN_MS             0.0f    // PID 输出下限：0ms 导通
+#define APP_PID_OUTPUT_MAX_MS             1000.0f // PID 输出上限：1000ms 导通（1s 全导通）
+// 控制任务启动后加载的运行 PID 参数（可根据现场调参修改）比例增益230等幅振荡点，周期9s。
+#define APP_PID_TASK_START_KP             85.5f
+#define APP_PID_TASK_START_KI             5.50f
+#define APP_PID_TASK_START_KD             0.0f
+
+#define APP_PID_ILIMIT_DEFAULT            50.0f // 积分限幅（%），防止积分风暴
+#define APP_PID_DEADBAND_C                0.2f  // 死区（℃）：误差落入该范围时保持当前输出
+#define APP_PID_ENABLE_INTEGRAL_SEPARATION 1    // 1=启用积分分离；0=传统积分
+#define APP_PID_INTEGRAL_SEPARATION_THRESHOLD_C 5.0f // 仅在误差绝对值不大于该值时累积积分
 
 // ======================== I2C and Peripheral Pins ================
 // I2C 总线定义：对应硬件图纸 IO11/IO12，速率 400kHz。
@@ -50,6 +61,7 @@
 #define APP_PWM_GPIO_CH0                  GPIO_NUM_4
 #define APP_PWM_GPIO_CH1                  GPIO_NUM_5
 #define APP_PWM_FREQ_HZ                   20000 // PWM 频率（Hz），20kHz 以上通常不可闻，适合加热控制。
+#define APP_PWM_PERIOD_MS                 1000.0f // 控制窗口：PID 输出 0~1000ms 映射为一个 1s 周期导通时长
 
 // ======================== External ADC ============================
 // 外部 ADC 地址与各通道命令字（来自需求文档定义）。
@@ -72,8 +84,8 @@
 
 // ======================== NTC Parameters ==========================
 // NTC 参数：10k 3950，串联电阻 10k，25℃ 标定。
-#define APP_NTC_SERIES_RES_OHM            10000.0f // NTC 分压串联电阻
-#define APP_NTC_R0_OHM                    10000.0f // NTC 25℃ 时阻值
+#define APP_NTC_SERIES_RES_OHM            10000.0f // NTC 分压串联电阻，10k 欧姆
+#define APP_NTC_R0_OHM                    10000.0f // NTC 25℃ 时阻值，10k 欧姆
 #define APP_NTC_BETA                      3950.0f
 #define APP_NTC_T0_C                      25.0f
 

@@ -4,10 +4,14 @@
 
 #include "app_config.h"
 
-// 保存最后一次设置值，便于遥测和调试读取。
-static float s_last_duty_percent = 0.0f;
+// 保存最后一次设置值（ms），便于遥测和调试读取。
+static float s_last_on_time_ms = 0.0f;
 
-static void pwm_apply(float duty_percent) {
+#ifndef APP_PWM_PERIOD_MS
+#define APP_PWM_PERIOD_MS 1000.0f
+#endif
+
+static void pwm_apply_percent(float duty_percent) {
     // 占空比限幅，避免异常输入导致驱动越界。
     if (duty_percent < 0.0f) {
         duty_percent = 0.0f;
@@ -26,8 +30,19 @@ static void pwm_apply(float duty_percent) {
 
     ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, duty);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
+}
 
-    s_last_duty_percent = duty_percent;
+void periph_pwm_set_on_time_ms(float on_time_ms) {
+    if (on_time_ms < 0.0f) {
+        on_time_ms = 0.0f;
+    }
+    if (on_time_ms > APP_PWM_PERIOD_MS) {
+        on_time_ms = APP_PWM_PERIOD_MS;
+    }
+
+    const float duty_percent = (on_time_ms / APP_PWM_PERIOD_MS) * 100.0f;
+    pwm_apply_percent(duty_percent);
+    s_last_on_time_ms = on_time_ms;
 }
 
 esp_err_t periph_pwm_init(void) {
@@ -80,18 +95,30 @@ esp_err_t periph_pwm_init(void) {
     }
 
     // 上电默认关断输出，避免瞬态加热。
-    pwm_apply(0.0f);
+    periph_pwm_set_on_time_ms(0.0f);
     return ESP_OK;
 }
 
 void periph_pwm_set_percent(float duty_percent) {
-    pwm_apply(duty_percent);
+    if (duty_percent < 0.0f) {
+        duty_percent = 0.0f;
+    }
+    if (duty_percent > 100.0f) {
+        duty_percent = 100.0f;
+    }
+
+    pwm_apply_percent(duty_percent);
+    s_last_on_time_ms = (duty_percent / 100.0f) * APP_PWM_PERIOD_MS;
 }
 
 void periph_pwm_force_off(void) {
-    pwm_apply(0.0f);
+    periph_pwm_set_on_time_ms(0.0f);
+}
+
+float periph_pwm_get_on_time_ms(void) {
+    return s_last_on_time_ms;
 }
 
 float periph_pwm_get_percent(void) {
-    return s_last_duty_percent;
+    return (s_last_on_time_ms / APP_PWM_PERIOD_MS) * 100.0f;
 }

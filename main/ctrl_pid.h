@@ -8,7 +8,7 @@
  * - setpoint：目标值。
  * - integral/prev_error：运行时状态量。
  * - integral_limit：积分限幅，防止积分饱和。
- * - out_min/out_max：输出限幅范围。
+ * - out_min/out_max：输出限幅范围（单位：ms，0~1000）。
  */
 
 typedef struct {
@@ -19,6 +19,7 @@ typedef struct {
     float setpoint;
     float integral;
     float prev_error;
+    float output;
 
     float integral_limit;
     float out_min;
