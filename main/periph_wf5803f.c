@@ -10,7 +10,7 @@
 #define WF5803F_REG_STATUS       0x02
 #define WF5803F_REG_PRESS_MSB    0x06
 #define WF5803F_REG_CMD          0x30
-#define WF5803F_CMD_SINGLE_TP    0x05
+#define WF5803F_CMD_SINGLE_TP    0x0A
 
 static float wf5803f_pressure_from_raw24(int32_t raw) {
     // 仅保留 24 位有效数据。
