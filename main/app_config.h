@@ -18,9 +18,9 @@
 #define FEATURE_NTC_CH3_ENABLE            0 // NTC 通道 3 使能
 #define FEATURE_WF5803F_ENABLE            0 // WF5803F 功能使能
 #define FEATURE_VOLTAGE_MONITOR_ENABLE    1 // 监测电压并上报，必要时触发保护
-#define FEATURE_UPLOAD_ENABLE             0 // 0: 仅串口日志；1: 同时 UDP 上传
+#define FEATURE_UPLOAD_ENABLE             1 // 0: 仅串口日志；1: 同时 UDP 上传
 // 无线总开关：0 时完全关闭 WiFi/UDP（不启动 WiFi，不创建 UDP 任务，不发 UDP 包）。
-#define FEATURE_WIRELESS_ENABLE           0 // 有线调试建议设为 0，避免无线重连导致调试干扰
+#define FEATURE_WIRELESS_ENABLE           1 // 有线调试建议设为 0，避免无线重连导致调试干扰
 
 // ======================== Control Loop ============================
 // 控制任务周期（毫秒）：越小响应越快，但 CPU 占用和噪声敏感度越高。
@@ -33,7 +33,7 @@
 #define APP_SAFE_SETPOINT_C               30.0f
 
 // PID 默认参数（上电初始值，可被运行时命令覆盖）。
-#define APP_DEFAULT_SETPOINT_C            40.0f // 初始目标温度（℃）
+#define APP_DEFAULT_SETPOINT_C            30.0f // 初始目标温度（℃）
 #define APP_PID_KP_DEFAULT                0.0f  // 固定默认值：上电阶段 Kp 必须为 0（勿改）
 #define APP_PID_KI_DEFAULT                0.0f  // 固定默认值：上电阶段 Ki 必须为 0（勿改）
 #define APP_PID_KD_DEFAULT                0.0f  // 固定默认值：上电阶段 Kd 必须为 0（勿改）
@@ -103,7 +103,7 @@
 #define APP_WIFI_PASSWORD                 "12345678"
 #define APP_WIFI_MAX_RETRY                10
 
-#define APP_UDP_REMOTE_IP                 "192.168.1.100"
+#define APP_UDP_REMOTE_IP                 "192.168.137.1"
 #define APP_UDP_REMOTE_PORT               6000
 #define APP_UDP_LOCAL_PORT                6001
 
