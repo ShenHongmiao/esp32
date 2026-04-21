@@ -269,8 +269,10 @@ static void control_task(void *arg) {
 		sample_peripherals(&sample);
 
 		// 2) 将采样结果写入共享状态，并取出当前设定值与心跳时间。
-		uint32_t last_hb = 0;
 		float requested_sp = APP_DEFAULT_SETPOINT_C;
+#if FEATURE_WIRELESS_ENABLE
+		uint32_t last_hb = 0;
+#endif
 		xSemaphoreTake(s_state_lock, portMAX_DELAY);
 		s_state.ntc_temp_c[0] = sample.ntc_temp_c[0];
 		s_state.ntc_temp_c[1] = sample.ntc_temp_c[1];
@@ -290,15 +292,22 @@ static void control_task(void *arg) {
 		s_state.supply_voltage_v = sample.supply_voltage_v;
 		s_state.undervoltage = sample.undervoltage;
 
+#if FEATURE_WIRELESS_ENABLE
 		last_hb = s_state.last_heartbeat_ms;
+#endif
 		requested_sp = s_state.requested_setpoint_c;
 		xSemaphoreGive(s_state_lock);
 
 		// 3) 选择控制温度源并计算失联保护后的有效设定值。
 		const float process_temp = select_process_temperature(&sample);
+		float effective_sp = requested_sp;
+#if FEATURE_WIRELESS_ENABLE
 		const uint32_t now_ms = app_now_ms();
-		const float effective_sp =
-			ctrl_failsafe_effective_setpoint(&s_failsafe, now_ms, last_hb, requested_sp);
+		effective_sp = ctrl_failsafe_effective_setpoint(&s_failsafe, now_ms, last_hb, requested_sp);
+#else
+		// 无线上位机关闭时不依赖心跳，避免单机调试被误判为失联保护。
+		s_failsafe.safe_mode = false;
+#endif
 
 		// 4) 温度有效时执行 PID；否则直接关断 PWM。
 		float pwm_on_ms = 0.0f;

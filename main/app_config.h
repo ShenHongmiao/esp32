@@ -13,10 +13,10 @@
 // ======================== Feature Switches ========================
 // 功能总开关：采集与上传使用同一组使能，避免“采了但没发”或“发了无数据”。
 #define FEATURE_NTC_CH0_ENABLE            1 // NTC 通道 0 使能，ADC_CH1，下侧分压测温
-#define FEATURE_NTC_CH1_ENABLE            1 // NTC 通道 1 使能, ADC_CH2
-#define FEATURE_NTC_CH2_ENABLE            1 // NTC 通道 2 使能, ADC_CH3
-#define FEATURE_NTC_CH3_ENABLE            1 // NTC 通道 3 使能
-#define FEATURE_WF5803F_ENABLE            1 // WF5803F 功能使能
+#define FEATURE_NTC_CH1_ENABLE            0 // NTC 通道 1 使能, ADC_CH2
+#define FEATURE_NTC_CH2_ENABLE            0 // NTC 通道 2 使能, ADC_CH3
+#define FEATURE_NTC_CH3_ENABLE            0 // NTC 通道 3 使能
+#define FEATURE_WF5803F_ENABLE            0 // WF5803F 功能使能
 #define FEATURE_VOLTAGE_MONITOR_ENABLE    1 // 监测电压并上报，必要时触发保护
 #define FEATURE_UPLOAD_ENABLE             0 // 0: 仅串口日志；1: 同时 UDP 上传
 // 无线总开关：0 时完全关闭 WiFi/UDP（不启动 WiFi，不创建 UDP 任务，不发 UDP 包）。
@@ -33,7 +33,7 @@
 #define APP_SAFE_SETPOINT_C               30.0f
 
 // PID 默认参数（上电初始值，可被运行时命令覆盖）。
-#define APP_DEFAULT_SETPOINT_C            30.0f // 初始目标温度（℃）
+#define APP_DEFAULT_SETPOINT_C            40.0f // 初始目标温度（℃）
 #define APP_PID_KP_DEFAULT                0.0f  // 固定默认值：上电阶段 Kp 必须为 0（勿改）
 #define APP_PID_KI_DEFAULT                0.0f  // 固定默认值：上电阶段 Ki 必须为 0（勿改）
 #define APP_PID_KD_DEFAULT                0.0f  // 固定默认值：上电阶段 Kd 必须为 0（勿改）
@@ -42,7 +42,7 @@
 #define APP_PID_OUTPUT_MAX_MS             1000.0f // PID 输出上限：1000ms 导通（1s 全导通）
 // 控制任务启动后加载的运行 PID 参数（可根据现场调参修改）比例增益230等幅振荡点，周期9s。
 #define APP_PID_TASK_START_KP             85.5f
-#define APP_PID_TASK_START_KI             5.50f
+#define APP_PID_TASK_START_KI             8.50f
 #define APP_PID_TASK_START_KD             0.0f
 
 #define APP_PID_ILIMIT_DEFAULT            50.0f // 积分限幅（%），防止积分风暴
@@ -58,6 +58,8 @@
 #define APP_I2C_FREQ_HZ                   400000      // I2C 时钟频率（Hz），400kHz 属于高速模式，适合大多数传感器。
 
 // PWM 输出定义：双通道同占空比输出到两路 NMOS 栅极。
+#define APP_PWM_CH0_ENABLE               0 // PWM CH0 开关：1=使能输出，0=禁用
+#define APP_PWM_CH1_ENABLE               1 // PWM CH1 开关：1=使能输出，0=禁用
 #define APP_PWM_GPIO_CH0                  GPIO_NUM_4
 #define APP_PWM_GPIO_CH1                  GPIO_NUM_5
 #define APP_PWM_FREQ_HZ                   20000 // PWM 频率（Hz），20kHz 以上通常不可闻，适合加热控制。

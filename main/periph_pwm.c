@@ -11,6 +11,14 @@ static float s_last_on_time_ms = 0.0f;
 #define APP_PWM_PERIOD_MS 1000.0f
 #endif
 
+#ifndef APP_PWM_CH0_ENABLE
+#define APP_PWM_CH0_ENABLE 1
+#endif
+
+#ifndef APP_PWM_CH1_ENABLE
+#define APP_PWM_CH1_ENABLE 1
+#endif
+
 static void pwm_apply_percent(float duty_percent) {
     // 占空比限幅，避免异常输入导致驱动越界。
     if (duty_percent < 0.0f) {
@@ -24,12 +32,16 @@ static void pwm_apply_percent(float duty_percent) {
     const uint32_t max_duty = (1u << LEDC_TIMER_10_BIT) - 1u;
     const uint32_t duty = (uint32_t)((duty_percent / 100.0f) * (float)max_duty);
 
-    // 双通道同步输出，保证两路加热功率一致。
+    // 仅对配置中使能的通道下发占空比。
+#if APP_PWM_CH0_ENABLE
     ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+#endif
 
+#if APP_PWM_CH1_ENABLE
     ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, duty);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
+#endif
 }
 
 void periph_pwm_set_on_time_ms(float on_time_ms) {
@@ -61,6 +73,7 @@ esp_err_t periph_pwm_init(void) {
     }
 
     // 通道 0 绑定 GPIO4。
+#if APP_PWM_CH0_ENABLE
     const ledc_channel_config_t ch0 = {
         .gpio_num = APP_PWM_GPIO_CH0,
         .speed_mode = LEDC_LOW_SPEED_MODE,
@@ -71,8 +84,10 @@ esp_err_t periph_pwm_init(void) {
         .hpoint = 0,
         .sleep_mode = LEDC_SLEEP_MODE_NO_ALIVE_NO_PD,
     };
+#endif
 
     // 通道 1 绑定 GPIO5。
+#if APP_PWM_CH1_ENABLE
     const ledc_channel_config_t ch1 = {
         .gpio_num = APP_PWM_GPIO_CH1,
         .speed_mode = LEDC_LOW_SPEED_MODE,
@@ -83,16 +98,21 @@ esp_err_t periph_pwm_init(void) {
         .hpoint = 0,
         .sleep_mode = LEDC_SLEEP_MODE_NO_ALIVE_NO_PD,
     };
+#endif
 
+#if APP_PWM_CH0_ENABLE
     err = ledc_channel_config(&ch0);
     if (err != ESP_OK) {
         return err;
     }
+#endif
 
+#if APP_PWM_CH1_ENABLE
     err = ledc_channel_config(&ch1);
     if (err != ESP_OK) {
         return err;
     }
+#endif
 
     // 上电默认关断输出，避免瞬态加热。
     periph_pwm_set_on_time_ms(0.0f);
