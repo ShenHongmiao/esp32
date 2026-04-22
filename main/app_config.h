@@ -25,9 +25,9 @@
 
 // ======================== Control Loop ============================
 // 控制任务周期（毫秒）：越小响应越快，但 CPU 占用和噪声敏感度越高。
-#define APP_CONTROL_PERIOD_MS             50
+#define APP_CONTROL_PERIOD_MS             20
 // 遥测上报周期（毫秒）：用于串口日志和 UDP 上传节流。
-#define APP_TELEMETRY_PERIOD_MS           200
+#define APP_TELEMETRY_PERIOD_MS           50
 // 心跳超时（毫秒）：超过该时间未收到上位机命令则进入安全模式。
 #define APP_HEARTBEAT_TIMEOUT_MS          5000
 // 安全模式目标温度（摄氏度）：失联时回退到该设定。

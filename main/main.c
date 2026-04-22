@@ -542,11 +542,22 @@ void app_main(void) {
 #endif
 
 	// 6) 启动各业务任务。
-	xTaskCreate(control_task, "control_task", 4096, NULL, 8, NULL);//控制任务优先级最高，确保及时响应。
-	xTaskCreate(telemetry_task, "telemetry_task", 4096, NULL, 5, NULL);//遥测任务优先级适中，保证稳定输出同时不干扰控制。
+	// 双核分工：通信相关任务（UDP、控制台）放在 core_comm，控制任务放在 core_ctrl，OTA 任务放在 core_comm 避免干扰控制。
+	const BaseType_t core_comm = 0;
+	const BaseType_t core_ctrl = 1;
+
+	// 控制任务优先级最高，且独占一个核心，确保控制响应的实时性和稳定性。
+	xTaskCreatePinnedToCore(control_task, "control_task", 4096, NULL, 8, NULL, core_ctrl);
+	// 遥测任务优先级适中，保证稳定输出同时不干扰控制。
+	// 数据发送任务，（如 UDP）优先级同遥测，避免发送阻塞导致数据积压。
+	xTaskCreatePinnedToCore(telemetry_task, "telemetry_task", 4096, NULL, 5, NULL, core_comm);
 #if FEATURE_WIRELESS_ENABLE
-	xTaskCreate(udp_command_task, "udp_cmd_task", 4096, NULL, 6, NULL);
+	// UDP 命令接收任务（负责接收和处理 UDP 命令），归入 send 核心。
+	xTaskCreatePinnedToCore(udp_command_task, "udp_cmd_task", 4096, NULL, 6, NULL, core_comm);
 #endif
-	xTaskCreate(console_command_task, "console_cmd_task", 4096, NULL, 6, NULL);
-	xTaskCreate(ota_task, "ota_task", 6144, NULL, 4, NULL);
+	// 控制台命令任务（负责处理串口输入的调试命令），优先级同 UDP 命令，归入 control 核心。
+	xTaskCreatePinnedToCore(console_command_task, "console_cmd_task", 4096, NULL, 6, NULL, core_comm);
+	// OTA 任务，归入 other 核心。
+	xTaskCreatePinnedToCore(ota_task, "ota_task", 6144, NULL, 4, NULL, core_comm);
 }
+                                                 
