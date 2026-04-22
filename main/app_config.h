@@ -22,6 +22,8 @@
 #define FEATURE_UPLOAD_ENABLE             1 // 0: 仅串口日志；1: 同时 UDP 上传
 // 无线总开关：0 时完全关闭 WiFi/UDP（不启动 WiFi，不创建 UDP 任务，不发 UDP 包）。
 #define FEATURE_WIRELESS_ENABLE           1 // 有线调试建议设为 0，避免无线重连导致调试干扰
+// 心跳失联保护开关：1=启用超时降级到安全温度；0=忽略心跳超时。
+#define FEATURE_HEARTBEAT_FAILSAFE_ENABLE 0
 
 // ======================== Control Loop ============================
 // 控制任务周期（毫秒）：越小响应越快，但 CPU 占用和噪声敏感度越高。

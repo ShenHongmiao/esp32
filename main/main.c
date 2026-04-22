@@ -302,8 +302,13 @@ static void control_task(void *arg) {
 		const float process_temp = select_process_temperature(&sample);
 		float effective_sp = requested_sp;
 #if FEATURE_WIRELESS_ENABLE
-		const uint32_t now_ms = app_now_ms();
-		effective_sp = ctrl_failsafe_effective_setpoint(&s_failsafe, now_ms, last_hb, requested_sp);
+		#if FEATURE_HEARTBEAT_FAILSAFE_ENABLE
+			const uint32_t now_ms = app_now_ms();
+			effective_sp = ctrl_failsafe_effective_setpoint(&s_failsafe, now_ms, last_hb, requested_sp);
+		#else
+			// 关闭心跳失联保护时，始终采用请求设定值。
+			s_failsafe.safe_mode = false;
+		#endif
 #else
 		// 无线上位机关闭时不依赖心跳，避免单机调试被误判为失联保护。
 		s_failsafe.safe_mode = false;
