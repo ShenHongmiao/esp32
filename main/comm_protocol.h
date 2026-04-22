@@ -20,6 +20,7 @@ enum {
     COMM_CMD_NTC = 0x01,
     COMM_CMD_WF5803F = 0x02,
     COMM_CMD_VOLTAGE = 0x03,
+    COMM_CMD_PID_OUT = 0x04,
     COMM_CMD_TEXT_INFO = 0x0F,
 };
 
@@ -43,6 +44,9 @@ size_t comm_protocol_pack_wf_payload(float temperature_c, float pressure_kpa, ui
 
 // 打包系统电压载荷。
 size_t comm_protocol_pack_voltage_payload(float voltage_v, bool undervoltage, uint8_t *out_payload, size_t out_cap);
+
+// 打包 PID 输出载荷（单位：ms）。
+size_t comm_protocol_pack_pid_out_payload(float pid_out_ms, uint8_t *out_payload, size_t out_cap);
 
 // 打包文本信息载荷。
 size_t comm_protocol_pack_text_payload(const char *text, uint8_t *out_payload, size_t out_cap);

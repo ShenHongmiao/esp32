@@ -18,6 +18,7 @@
 #define FEATURE_NTC_CH3_ENABLE            0 // NTC 通道 3 使能
 #define FEATURE_WF5803F_ENABLE            0 // WF5803F 功能使能
 #define FEATURE_VOLTAGE_MONITOR_ENABLE    1 // 监测电压并上报，必要时触发保护
+#define FEATURE_PID_OUT_ENABLE            1 // 发送 PID 输出值
 #define FEATURE_UPLOAD_ENABLE             1 // 0: 仅串口日志；1: 同时 UDP 上传
 // 无线总开关：0 时完全关闭 WiFi/UDP（不启动 WiFi，不创建 UDP 任务，不发 UDP 包）。
 #define FEATURE_WIRELESS_ENABLE           1 // 有线调试建议设为 0，避免无线重连导致调试干扰

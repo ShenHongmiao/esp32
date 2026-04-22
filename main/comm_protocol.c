@@ -136,6 +136,16 @@ size_t comm_protocol_pack_voltage_payload(float voltage_v, bool undervoltage, ui
     return 3;
 }
 
+size_t comm_protocol_pack_pid_out_payload(float pid_out_ms, uint8_t *out_payload, size_t out_cap) {
+    // 固定字段：int32 PID 输出(ms×100)，共 4 字节。
+    if (out_payload == NULL || out_cap < 4) {
+        return 0;
+    }
+
+    write_i32_le(&out_payload[0], scale100_to_i32(pid_out_ms));
+    return 4;
+}
+
 size_t comm_protocol_pack_text_payload(const char *text, uint8_t *out_payload, size_t out_cap) {
     // 文本按原样拷贝，不做编码转换。
     if (text == NULL || out_payload == NULL || out_cap == 0) {

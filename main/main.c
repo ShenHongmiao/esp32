@@ -420,6 +420,16 @@ static void telemetry_task(void *arg) {
 		}
 #endif
 
+#if FEATURE_PID_OUT_ENABLE
+		// PID 输出帧（ms）。
+		uint8_t payload_pid[4] = {0};
+		const size_t pid_len = comm_protocol_pack_pid_out_payload(
+			snapshot.pwm_on_ms, payload_pid, sizeof(payload_pid));
+		if (pid_len > 0) {
+			telemetry_send(COMM_CMD_PID_OUT, payload_pid, pid_len);
+		}
+#endif
+
 		// 控制上报频率。
 		vTaskDelay(pdMS_TO_TICKS(APP_TELEMETRY_PERIOD_MS));
 	}
