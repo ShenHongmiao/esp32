@@ -61,10 +61,28 @@ typedef struct {
 
 static const char *TAG = "heater_app";
 
+#if APP_NTC_FILTER_WINDOW_SIZE < 1
+#error "APP_NTC_FILTER_WINDOW_SIZE must be >= 1"
+#endif
+
+#if APP_NTC_SAMPLE_PERIOD_MS < 1
+#error "APP_NTC_SAMPLE_PERIOD_MS must be >= 1"
+#endif
+
+typedef struct {
+	float voltage_ring[4][APP_NTC_FILTER_WINDOW_SIZE];
+	float voltage_sum[4];
+	float filtered_voltage_v[4];
+	uint8_t ring_head[4];
+	uint8_t sample_count[4];
+	bool filtered_valid[4];
+} ntc_filter_state_t;
+
 static SemaphoreHandle_t s_state_lock;
 static app_runtime_t s_state;
 static ctrl_pid_t s_pid;
 static ctrl_failsafe_t s_failsafe;
+static ntc_filter_state_t s_ntc_filter;
 
 static uint32_t app_now_ms(void) {
 	// 统一使用 esp_timer 提供的微秒计时，再转换为毫秒。
@@ -110,76 +128,62 @@ static float select_process_temperature(const app_runtime_t *sample) {
 	return NAN;
 }
 
-static void sample_peripherals(app_runtime_t *sample) {
-	// 每次采样前先清空有效位，只有读取成功才置为 true。
-	sample->ntc_valid[0] = false;
-	sample->ntc_valid[1] = false;
-	sample->ntc_valid[2] = false;
-	sample->ntc_valid[3] = false;
+static void ntc_filter_reset(ntc_filter_state_t *filter) {
+	if (filter == NULL) {
+		return;
+	}
+
+	for (uint32_t ch = 0; ch < 4; ++ch) {
+		filter->voltage_sum[ch] = 0.0f;
+		filter->filtered_voltage_v[ch] = 0.0f;
+		filter->ring_head[ch] = 0;
+		filter->sample_count[ch] = 0;
+		filter->filtered_valid[ch] = false;
+		for (uint32_t i = 0; i < APP_NTC_FILTER_WINDOW_SIZE; ++i) {
+			filter->voltage_ring[ch][i] = 0.0f;
+		}
+	}
+}
+
+static bool sample_ntc_voltage_channel(uint8_t channel, uint8_t adc_cmd, float *out_voltage_v) {
+	uint16_t raw = 0;
+	const esp_err_t err = periph_adc_read_raw12(adc_cmd, &raw);
+	if (err != ESP_OK) {
+		ESP_LOGE(TAG, "ntc ch%u adc read failed: %s", channel, esp_err_to_name(err));
+		return false;
+	}
+
+	*out_voltage_v = periph_adc_raw12_to_voltage(raw, APP_ADC_VREF_V);
+	return true;
+}
+
+static void ntc_filter_push_voltage_locked(ntc_filter_state_t *filter, uint8_t channel, float voltage_v) {
+	const uint8_t head = filter->ring_head[channel];
+	uint8_t count = filter->sample_count[channel];
+
+	if (count == APP_NTC_FILTER_WINDOW_SIZE) {
+		filter->voltage_sum[channel] -= filter->voltage_ring[channel][head];
+	} else {
+		count++;
+	}
+
+	filter->voltage_ring[channel][head] = voltage_v;
+	filter->voltage_sum[channel] += voltage_v;
+	filter->sample_count[channel] = count;
+	filter->ring_head[channel] = (uint8_t)((head + 1U) % APP_NTC_FILTER_WINDOW_SIZE);
+	filter->filtered_voltage_v[channel] = filter->voltage_sum[channel] / (float)count;
+	filter->filtered_valid[channel] = true;
+}
+
+static void sample_non_ntc_peripherals(app_runtime_t *sample) {
 	sample->wf_valid = false;
 
 #if FEATURE_VOLTAGE_MONITOR_ENABLE
-	// 读取电源分压通道并换算输入电压，同时判断欠压。
+	// 电源检测每个控制周期采样一次。
 	uint16_t raw_vdet = 0;
 	if (periph_adc_read_raw12(APP_EXT_ADC_CMD_VDETECT, &raw_vdet) == ESP_OK) {
 		sample->supply_voltage_v = periph_adc_calc_supply_voltage(raw_vdet);
 		sample->undervoltage = sample->supply_voltage_v < APP_UNDERVOLTAGE_THRESHOLD_V;
-	}
-#endif
-
-#if FEATURE_NTC_CH0_ENABLE
-	// NTC CH0：先读 ADC，再按 Beta 模型换算温度。
-	uint16_t raw_ch0 = 0;
-	if (periph_adc_read_raw12(APP_EXT_ADC_CMD_NTC0, &raw_ch0) == ESP_OK) {
-		float temp_c = 0.0f;
-		const float v_ntc = periph_adc_raw12_to_voltage(raw_ch0, APP_ADC_VREF_V);
-		sample->ntc_voltage_v[0] = v_ntc;
-		if (ctrl_ntc_voltage_to_temp_c(v_ntc, &temp_c)) {
-			sample->ntc_temp_c[0] = temp_c;
-			sample->ntc_valid[0] = true;
-		}
-	}
-#endif
-
-#if FEATURE_NTC_CH1_ENABLE
-	// NTC CH1：流程同 CH0。
-	uint16_t raw_ch1 = 0;
-	if (periph_adc_read_raw12(APP_EXT_ADC_CMD_NTC1, &raw_ch1) == ESP_OK) {
-		float temp_c = 0.0f;
-		const float v_ntc = periph_adc_raw12_to_voltage(raw_ch1, APP_ADC_VREF_V);
-		sample->ntc_voltage_v[1] = v_ntc;
-		if (ctrl_ntc_voltage_to_temp_c(v_ntc, &temp_c)) {
-			sample->ntc_temp_c[1] = temp_c;
-			sample->ntc_valid[1] = true;
-		}
-	}
-#endif
-
-#if FEATURE_NTC_CH2_ENABLE
-	// NTC CH2：流程同 CH0。
-	uint16_t raw_ch2 = 0;
-	if (periph_adc_read_raw12(APP_EXT_ADC_CMD_NTC2, &raw_ch2) == ESP_OK) {
-		float temp_c = 0.0f;
-		const float v_ntc = periph_adc_raw12_to_voltage(raw_ch2, APP_ADC_VREF_V);
-		sample->ntc_voltage_v[2] = v_ntc;
-		if (ctrl_ntc_voltage_to_temp_c(v_ntc, &temp_c)) {
-			sample->ntc_temp_c[2] = temp_c;
-			sample->ntc_valid[2] = true;
-		}
-	}
-#endif
-
-#if FEATURE_NTC_CH3_ENABLE
-	// NTC CH3：流程同 CH0。
-	uint16_t raw_ch3 = 0;
-	if (periph_adc_read_raw12(APP_EXT_ADC_CMD_NTC3, &raw_ch3) == ESP_OK) {
-		float temp_c = 0.0f;
-		const float v_ntc = periph_adc_raw12_to_voltage(raw_ch3, APP_ADC_VREF_V);
-		sample->ntc_voltage_v[3] = v_ntc;
-		if (ctrl_ntc_voltage_to_temp_c(v_ntc, &temp_c)) {
-			sample->ntc_temp_c[3] = temp_c;
-			sample->ntc_valid[3] = true;
-		}
 	}
 #endif
 
@@ -189,6 +193,96 @@ static void sample_peripherals(app_runtime_t *sample) {
 		sample->wf_valid = true;
 	}
 #endif
+}
+
+static void sampling_task(void *arg) {
+	(void)arg;
+
+	const TickType_t sample_period_ticks =
+		(pdMS_TO_TICKS(APP_NTC_SAMPLE_PERIOD_MS) > 0) ? pdMS_TO_TICKS(APP_NTC_SAMPLE_PERIOD_MS) : 1;
+	uint32_t slow_sample_div_u32 = APP_CONTROL_PERIOD_MS / APP_NTC_SAMPLE_PERIOD_MS;
+	if (slow_sample_div_u32 == 0U) {
+		slow_sample_div_u32 = 1U;
+	}
+	if (slow_sample_div_u32 > 255U) {
+		slow_sample_div_u32 = 255U;
+	}
+	const uint8_t slow_sample_div = (uint8_t)slow_sample_div_u32;
+	static uint8_t slow_sample_counter = 0;
+	TickType_t sys_tick_count_sample = xTaskGetTickCount();
+	app_runtime_t slow_sample = {0};
+	sample_non_ntc_peripherals(&slow_sample);
+
+	while (1) {
+		float sampled_voltage_v[4] = {0};
+		bool sampled_valid[4] = {false};
+		app_runtime_t sensor_snapshot = slow_sample;
+
+#if FEATURE_NTC_CH0_ENABLE
+		sampled_valid[0] =
+			sample_ntc_voltage_channel(0U, APP_EXT_ADC_CMD_NTC0, &sampled_voltage_v[0]);
+#endif
+#if FEATURE_NTC_CH1_ENABLE
+		sampled_valid[1] =
+			sample_ntc_voltage_channel(1U, APP_EXT_ADC_CMD_NTC1, &sampled_voltage_v[1]);
+#endif
+#if FEATURE_NTC_CH2_ENABLE
+		sampled_valid[2] =
+			sample_ntc_voltage_channel(2U, APP_EXT_ADC_CMD_NTC2, &sampled_voltage_v[2]);
+#endif
+#if FEATURE_NTC_CH3_ENABLE
+		sampled_valid[3] =
+			sample_ntc_voltage_channel(3U, APP_EXT_ADC_CMD_NTC3, &sampled_voltage_v[3]);
+#endif
+
+		for (uint32_t ch = 0; ch < 4; ++ch) {
+			if (sampled_valid[ch]) {
+				ntc_filter_push_voltage_locked(&s_ntc_filter, (uint8_t)ch, sampled_voltage_v[ch]);
+			}
+
+			sensor_snapshot.ntc_valid[ch] = false;
+			sensor_snapshot.ntc_voltage_v[ch] = 0.0f;
+			sensor_snapshot.ntc_temp_c[ch] = 0.0f;
+
+			if (s_ntc_filter.filtered_valid[ch]) {
+				float temp_c = 0.0f;
+				const float filtered_voltage_v = s_ntc_filter.filtered_voltage_v[ch];
+				if (ctrl_ntc_voltage_to_temp_c(filtered_voltage_v, &temp_c)) {
+					sensor_snapshot.ntc_valid[ch] = true;
+					sensor_snapshot.ntc_voltage_v[ch] = filtered_voltage_v;
+					sensor_snapshot.ntc_temp_c[ch] = temp_c;
+				} else {
+					ESP_LOGE(TAG, "ntc ch%u convert failed: v=%.3f", (unsigned int)ch, filtered_voltage_v);
+				}
+			}
+		}
+
+		slow_sample_counter++;
+		if (slow_sample_counter >= slow_sample_div) {
+			sample_non_ntc_peripherals(&slow_sample);
+			sensor_snapshot.wf_temp_c = slow_sample.wf_temp_c;
+			sensor_snapshot.wf_pressure_kpa = slow_sample.wf_pressure_kpa;
+			sensor_snapshot.wf_valid = slow_sample.wf_valid;
+			sensor_snapshot.supply_voltage_v = slow_sample.supply_voltage_v;
+			sensor_snapshot.undervoltage = slow_sample.undervoltage;
+			slow_sample_counter = 0;
+		}
+
+		xSemaphoreTake(s_state_lock, portMAX_DELAY);
+		for (uint32_t ch = 0; ch < 4; ++ch) {
+			s_state.ntc_temp_c[ch] = sensor_snapshot.ntc_temp_c[ch];
+			s_state.ntc_voltage_v[ch] = sensor_snapshot.ntc_voltage_v[ch];
+			s_state.ntc_valid[ch] = sensor_snapshot.ntc_valid[ch];
+		}
+		s_state.wf_temp_c = sensor_snapshot.wf_temp_c;
+		s_state.wf_pressure_kpa = sensor_snapshot.wf_pressure_kpa;
+		s_state.wf_valid = sensor_snapshot.wf_valid;
+		s_state.supply_voltage_v = sensor_snapshot.supply_voltage_v;
+		s_state.undervoltage = sensor_snapshot.undervoltage;
+		xSemaphoreGive(s_state_lock);
+
+		vTaskDelayUntil(&sys_tick_count_sample, sample_period_ticks);
+	}
 }
 
 static void apply_command(const comm_command_t *cmd) {
@@ -264,33 +358,26 @@ static void control_task(void *arg) {
 			 APP_PID_TASK_START_KD);
 
 	while (1) {
-		// 1) 采样所有外设数据。
 		app_runtime_t sample = {0};
-		sample_peripherals(&sample);
 
-		// 2) 将采样结果写入共享状态，并取出当前设定值与心跳时间。
+		// 1) 在极短临界区复制最新传感器快照与控制输入。
 		float requested_sp = APP_DEFAULT_SETPOINT_C;
 #if FEATURE_WIRELESS_ENABLE
 		uint32_t last_hb = 0;
 #endif
+		bool ota_pending = false;
 		xSemaphoreTake(s_state_lock, portMAX_DELAY);
-		s_state.ntc_temp_c[0] = sample.ntc_temp_c[0];
-		s_state.ntc_temp_c[1] = sample.ntc_temp_c[1];
-		s_state.ntc_temp_c[2] = sample.ntc_temp_c[2];
-		s_state.ntc_temp_c[3] = sample.ntc_temp_c[3];
-		s_state.ntc_voltage_v[0] = sample.ntc_voltage_v[0];
-		s_state.ntc_voltage_v[1] = sample.ntc_voltage_v[1];
-		s_state.ntc_voltage_v[2] = sample.ntc_voltage_v[2];
-		s_state.ntc_voltage_v[3] = sample.ntc_voltage_v[3];
-		s_state.ntc_valid[0] = sample.ntc_valid[0];
-		s_state.ntc_valid[1] = sample.ntc_valid[1];
-		s_state.ntc_valid[2] = sample.ntc_valid[2];
-		s_state.ntc_valid[3] = sample.ntc_valid[3];
-		s_state.wf_temp_c = sample.wf_temp_c;
-		s_state.wf_pressure_kpa = sample.wf_pressure_kpa;
-		s_state.wf_valid = sample.wf_valid;
-		s_state.supply_voltage_v = sample.supply_voltage_v;
-		s_state.undervoltage = sample.undervoltage;
+		for (uint32_t ch = 0; ch < 4; ++ch) {
+			sample.ntc_temp_c[ch] = s_state.ntc_temp_c[ch];
+			sample.ntc_voltage_v[ch] = s_state.ntc_voltage_v[ch];
+			sample.ntc_valid[ch] = s_state.ntc_valid[ch];
+		}
+		sample.wf_temp_c = s_state.wf_temp_c;
+		sample.wf_pressure_kpa = s_state.wf_pressure_kpa;
+		sample.wf_valid = s_state.wf_valid;
+		sample.supply_voltage_v = s_state.supply_voltage_v;
+		sample.undervoltage = s_state.undervoltage;
+		ota_pending = s_state.ota_pending;
 
 #if FEATURE_WIRELESS_ENABLE
 		last_hb = s_state.last_heartbeat_ms;
@@ -298,7 +385,7 @@ static void control_task(void *arg) {
 		requested_sp = s_state.requested_setpoint_c;
 		xSemaphoreGive(s_state_lock);
 
-		// 3) 选择控制温度源并计算失联保护后的有效设定值。
+		// 2) 选择控制温度源并计算失联保护后的有效设定值。
 		const float process_temp = select_process_temperature(&sample);
 		float effective_sp = requested_sp;
 #if FEATURE_WIRELESS_ENABLE
@@ -314,7 +401,7 @@ static void control_task(void *arg) {
 		s_failsafe.safe_mode = false;
 #endif
 
-		// 4) 温度有效时执行 PID；否则直接关断 PWM。
+		// 3) 温度有效时执行 PID；否则直接关断 PWM。
 		float pwm_on_ms = 0.0f;
 		if (isfinite(process_temp)) {
 			xSemaphoreTake(s_state_lock, portMAX_DELAY);
@@ -322,7 +409,7 @@ static void control_task(void *arg) {
 			pwm_on_ms = ctrl_pid_update(&s_pid, process_temp, dt_s, NULL);
 
 			// 欠压或 OTA 挂起期间，强制输出为 0。
-			if (s_state.undervoltage || s_state.ota_pending) {
+			if (sample.undervoltage || ota_pending) {
 				pwm_on_ms = 0.0f;
 			}
 
@@ -339,7 +426,7 @@ static void control_task(void *arg) {
 			continue;
 		}
 
-		// 5) 将控制输出写入 PWM 驱动。
+		// 4) 将控制输出写入 PWM 驱动。
 		periph_pwm_set_on_time_ms(pwm_on_ms);
 		vTaskDelayUntil(&sys_tick_count_ctrl, control_period_ticks);
 	}
@@ -520,6 +607,9 @@ void app_main(void) {
 		return;
 	}
 
+	// 初始化 NTC 滑动窗口状态。
+	ntc_filter_reset(&s_ntc_filter);
+
 	// 3) 初始化运行态与控制参数。
 	runtime_init();
 	// 上电固定为 0/0/0，确保烧录与启动阶段不输出控制量。
@@ -551,6 +641,8 @@ void app_main(void) {
 	const BaseType_t core_comm = 0;
 	const BaseType_t core_ctrl = 1;
 
+	// NTC 后台采样任务：持续更新滑动窗口，降低控制链路等待。
+	xTaskCreatePinnedToCore(sampling_task, "sampling_task", 4096, NULL, 7, NULL, core_ctrl);
 	// 控制任务优先级最高，且独占一个核心，确保控制响应的实时性和稳定性。
 	xTaskCreatePinnedToCore(control_task, "control_task", 4096, NULL, 8, NULL, core_ctrl);
 	// 遥测任务优先级适中，保证稳定输出同时不干扰控制。

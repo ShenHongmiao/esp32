@@ -19,24 +19,28 @@
 #define FEATURE_WF5803F_ENABLE            0 // WF5803F 功能使能
 #define FEATURE_VOLTAGE_MONITOR_ENABLE    1 // 监测电压并上报，必要时触发保护
 #define FEATURE_PID_OUT_ENABLE            1 // 发送 PID 输出值
-#define FEATURE_UPLOAD_ENABLE             1 // 0: 仅串口日志；1: 同时 UDP 上传
+#define FEATURE_UPLOAD_ENABLE             0 // 0: 仅串口日志；1: 同时 UDP 上传
 // 无线总开关：0 时完全关闭 WiFi/UDP（不启动 WiFi，不创建 UDP 任务，不发 UDP 包）。
-#define FEATURE_WIRELESS_ENABLE           1 // 有线调试建议设为 0，避免无线重连导致调试干扰
+#define FEATURE_WIRELESS_ENABLE           0 // 有线调试建议设为 0，避免无线重连导致调试干扰
 // 心跳失联保护开关：1=启用超时降级到安全温度；0=忽略心跳超时。
 #define FEATURE_HEARTBEAT_FAILSAFE_ENABLE 0
 
 // ======================== Control Loop ============================
-// 控制任务周期（毫秒）：越小响应越快，但 CPU 占用和噪声敏感度越高。
+// 控制任务周期（毫秒）：越小响应越快，但 CPU 占用和噪声敏感度越高。也是其他任务（如采样、通信）的时间基准。
 #define APP_CONTROL_PERIOD_MS             20
+// NTC 后台采样周期（毫秒）：默认 2ms=500Hz，可按现场噪声与总线负载调到 2~10ms（约 500~100Hz）。
+#define APP_NTC_SAMPLE_PERIOD_MS          2
+// NTC 电压滑动窗口长度：后台每来一个样本滚动更新均值。
+#define APP_NTC_FILTER_WINDOW_SIZE        10
 // 遥测上报周期（毫秒）：用于串口日志和 UDP 上传节流。
-#define APP_TELEMETRY_PERIOD_MS           50
+#define APP_TELEMETRY_PERIOD_MS           100
 // 心跳超时（毫秒）：超过该时间未收到上位机命令则进入安全模式。
 #define APP_HEARTBEAT_TIMEOUT_MS          5000
 // 安全模式目标温度（摄氏度）：失联时回退到该设定。
 #define APP_SAFE_SETPOINT_C               30.0f
 
 // PID 默认参数（上电初始值，可被运行时命令覆盖）。
-#define APP_DEFAULT_SETPOINT_C            30.0f // 初始目标温度（℃）
+#define APP_DEFAULT_SETPOINT_C            50.0f // 初始目标温度（℃）
 #define APP_PID_KP_DEFAULT                0.0f  // 固定默认值：上电阶段 Kp 必须为 0（勿改）
 #define APP_PID_KI_DEFAULT                0.0f  // 固定默认值：上电阶段 Ki 必须为 0（勿改）
 #define APP_PID_KD_DEFAULT                0.0f  // 固定默认值：上电阶段 Kd 必须为 0（勿改）
@@ -45,7 +49,7 @@
 #define APP_PID_OUTPUT_MAX_MS             1000.0f // PID 输出上限：1000ms 导通（1s 全导通）
 // 控制任务启动后加载的运行 PID 参数（可根据现场调参修改）比例增益230等幅振荡点，周期9s。
 #define APP_PID_TASK_START_KP             85.5f
-#define APP_PID_TASK_START_KI             8.50f
+#define APP_PID_TASK_START_KI             21.25f
 #define APP_PID_TASK_START_KD             0.0f
 
 #define APP_PID_ILIMIT_DEFAULT            50.0f // 积分限幅（%），防止积分风暴

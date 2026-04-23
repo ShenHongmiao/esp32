@@ -1,13 +1,41 @@
 #include "periph_i2c.h"
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+
 #include "driver/i2c.h"
 
 #include "app_config.h"
 
 // 记录 I2C 是否已完成初始化，避免重复安装驱动。
 static bool s_i2c_ready = false;
+// I2C 总线级互斥锁：串行化所有事务，避免跨任务并发访问导致总线冲突。
+static SemaphoreHandle_t s_i2c_lock = NULL;
+
+static esp_err_t i2c_lock(void) {
+    if (s_i2c_lock == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (xSemaphoreTake(s_i2c_lock, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    return ESP_OK;
+}
+
+static void i2c_unlock(void) {
+    if (s_i2c_lock != NULL) {
+        xSemaphoreGive(s_i2c_lock);
+    }
+}
 
 esp_err_t periph_i2c_init(void) {
+    if (s_i2c_lock == NULL) {
+        s_i2c_lock = xSemaphoreCreateMutex();
+        if (s_i2c_lock == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
     // 已初始化时直接返回，保证接口幂等。
     if (s_i2c_ready) {
         return ESP_OK;
@@ -42,22 +70,36 @@ esp_err_t periph_i2c_init(void) {
 
 esp_err_t periph_i2c_write_then_read(uint8_t addr, const uint8_t *wbuf, size_t wlen, uint8_t *rbuf, size_t rlen) {
     // 防御式检查：确保先初始化后使用。
-    if (!s_i2c_ready) {
+    if (!s_i2c_ready || s_i2c_lock == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
 
+    esp_err_t err = i2c_lock();
+    if (err != ESP_OK) {
+        return err;
+    }
+
     // 典型时序：START + WRITE + RESTART + READ + STOP。
-    return i2c_master_write_read_device(APP_I2C_PORT, addr, wbuf, wlen, rbuf, rlen, pdMS_TO_TICKS(100));
+    err = i2c_master_write_read_device(APP_I2C_PORT, addr, wbuf, wlen, rbuf, rlen, pdMS_TO_TICKS(100));
+    i2c_unlock();
+    return err;
 }
 
 esp_err_t periph_i2c_write_reg(uint8_t addr, uint8_t reg, uint8_t value) {
     // 单寄存器写入格式：[reg][value]
     uint8_t payload[2] = {reg, value};
-    if (!s_i2c_ready) {
+    if (!s_i2c_ready || s_i2c_lock == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    return i2c_master_write_to_device(APP_I2C_PORT, addr, payload, sizeof(payload), pdMS_TO_TICKS(100));
+    esp_err_t err = i2c_lock();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = i2c_master_write_to_device(APP_I2C_PORT, addr, payload, sizeof(payload), pdMS_TO_TICKS(100));
+    i2c_unlock();
+    return err;
 }
 
 esp_err_t periph_i2c_read_reg(uint8_t addr, uint8_t reg, uint8_t *value) {

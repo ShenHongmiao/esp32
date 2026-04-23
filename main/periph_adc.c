@@ -9,6 +9,7 @@ esp_err_t periph_adc_read_raw12(uint8_t command, uint16_t *raw12) {
         return ESP_ERR_INVALID_ARG;
     }
 
+    // 线程安全由 periph_i2c_write_then_read 内部的 I2C 总线互斥锁保证。
     // 芯片返回两个字节：高字节低 4 位 + 低字节 8 位，共 12 位。
     uint8_t rx[2] = {0};
     esp_err_t err = periph_i2c_write_then_read(APP_EXT_ADC_ADDR, &command, 1, rx, sizeof(rx));
