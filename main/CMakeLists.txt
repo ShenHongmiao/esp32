@@ -3,6 +3,7 @@ idf_component_register(
         "main.c"
         "periph_i2c.c"
         "periph_adc.c"
+        "periph_pressure_dc.c"
         "periph_wf5803f.c"
         "periph_pwm.c"
         "ctrl_ntc.c"

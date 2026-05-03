@@ -12,16 +12,21 @@
 
 // ======================== Feature Switches ========================
 // 功能总开关：采集与上传使用同一组使能，避免“采了但没发”或“发了无数据”。
-#define FEATURE_NTC_CH0_ENABLE            1 // NTC 通道 0 使能，ADC_CH1，下侧分压测温
+#define FEATURE_NTC_CH0_ENABLE            0 // NTC 通道 0 使能，ADC_CH1，下侧分压测温
 #define FEATURE_NTC_CH1_ENABLE            0 // NTC 通道 1 使能, ADC_CH2
 #define FEATURE_NTC_CH2_ENABLE            0 // NTC 通道 2 使能, ADC_CH3
 #define FEATURE_NTC_CH3_ENABLE            0 // NTC 通道 3 使能
 #define FEATURE_WF5803F_ENABLE            0 // WF5803F 功能使能
+#define FEATURE_PRESSURE_ENABLE           1 // 气压检测总开关：1=启用；0=关闭
+#define FEATURE_PRESSURE_SOURCE_WF        0 // 气压来源：1=WF5803F
+#define FEATURE_PRESSURE_SOURCE_DC        1 // 气压来源：1=外部 DC 电压型
+#define FEATURE_PRESSURE_DC_CH1           1 // DC 通道 1 选择
+#define FEATURE_PRESSURE_DC_CH2           0 // DC 通道 2 选择
 #define FEATURE_VOLTAGE_MONITOR_ENABLE    1 // 监测电压并上报，必要时触发保护
 #define FEATURE_PID_OUT_ENABLE            1 // 发送 PID 输出值
-#define FEATURE_UPLOAD_ENABLE             0 // 0: 仅串口日志；1: 同时 UDP 上传
+#define FEATURE_UPLOAD_ENABLE             1 // 0: 仅串口日志；1: 同时 UDP 上传
 // 无线总开关：0 时完全关闭 WiFi/UDP（不启动 WiFi，不创建 UDP 任务，不发 UDP 包）。
-#define FEATURE_WIRELESS_ENABLE           0 // 有线调试建议设为 0，避免无线重连导致调试干扰
+#define FEATURE_WIRELESS_ENABLE           1 // 有线调试建议设为 0，避免无线重连导致调试干扰
 // 心跳失联保护开关：1=启用超时降级到安全温度；0=忽略心跳超时。
 #define FEATURE_HEARTBEAT_FAILSAFE_ENABLE 0
 
@@ -75,11 +80,19 @@
 // ======================== External ADC ============================
 // 外部 ADC 地址与各通道命令字（来自需求文档定义）。
 #define APP_EXT_ADC_ADDR                  0x48
-#define APP_EXT_ADC_CMD_VDETECT           0x84
+#define APP_EXT_ADC_CMD_VDETECT           0xE4 
 #define APP_EXT_ADC_CMD_NTC0              0xC4
 #define APP_EXT_ADC_CMD_NTC1              0x94
 #define APP_EXT_ADC_CMD_NTC2              0xD4
 #define APP_EXT_ADC_CMD_NTC3              0xA4
+#define APP_EXT_ADC_CMD_Press1            0xF4
+#define APP_EXT_ADC_CMD_Press2            0x84
+
+// DC 气压电压型传感器转换：Vout = 0.0188 * P + 0.2
+#define APP_PRESSURE_VOUT_SLOPE_V_PER_KPA 0.0188f
+#define APP_PRESSURE_VOUT_OFFSET_V        0.2f
+// DC 气压传感器输出经分压后进入 ADC（ADC 电压 = Vout / 2）。
+#define APP_PRESSURE_DC_VOUT_SCALE        2.0f
 
 // ADC 基础参数：12bit 满量程 4095，参考电压 3.3V。
 #define APP_ADC_VREF_V                    3.3f
@@ -106,7 +119,7 @@
 
 // ======================== WiFi / UDP =============================
 // WiFi 与 UDP 参数：联调时请按现场网络修改。
-#define APP_WIFI_SSID                     "ESP32-AP"
+#define APP_WIFI_SSID                     "ESP32"
 #define APP_WIFI_PASSWORD                 "12345678"
 #define APP_WIFI_MAX_RETRY                10
 

@@ -21,6 +21,7 @@ enum {
     COMM_CMD_WF5803F = 0x02,
     COMM_CMD_VOLTAGE = 0x03,
     COMM_CMD_PID_OUT = 0x04,
+    COMM_CMD_PRESSURE = 0x05,
     COMM_CMD_TEXT_INFO = 0x0F,
 };
 
@@ -47,6 +48,9 @@ size_t comm_protocol_pack_voltage_payload(float voltage_v, bool undervoltage, ui
 
 // 打包 PID 输出载荷（单位：ms）。
 size_t comm_protocol_pack_pid_out_payload(float pid_out_ms, uint8_t *out_payload, size_t out_cap);
+
+// 打包压力载荷（单位：kPa）。
+size_t comm_protocol_pack_pressure_payload(float pressure_kpa, uint8_t *out_payload, size_t out_cap);
 
 // 打包文本信息载荷。
 size_t comm_protocol_pack_text_payload(const char *text, uint8_t *out_payload, size_t out_cap);

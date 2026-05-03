@@ -13,6 +13,7 @@
 #include "nvs_flash.h"
 
 #include "app_config.h"
+#include "pressure_config.h"
 #include "comm_command.h"
 #include "comm_protocol.h"
 #include "comm_udp.h"
@@ -21,6 +22,7 @@
 #include "ctrl_pid.h"
 #include "periph_adc.h"
 #include "periph_i2c.h"
+#include "periph_pressure_dc.h"
 #include "periph_pwm.h"
 #include "periph_wf5803f.h"
 #include "sys_ota.h"
@@ -43,6 +45,11 @@ typedef struct {
 	float wf_temp_c;
 	float wf_pressure_kpa;
 	bool wf_valid;
+
+	// DC pressure sensor sample (voltage output).
+	float dc_pressure_kpa;
+	float dc_pressure_voltage_v;
+	bool dc_pressure_valid;
 
     // 电源电压与欠压状态。
 	float supply_voltage_v;
@@ -106,6 +113,9 @@ static void runtime_init(void) {
 	s_state.last_heartbeat_ms = app_now_ms();
 	s_state.process_temp_c = APP_DEFAULT_SETPOINT_C;
 	s_state.pwm_on_ms = 0.0f;
+	s_state.dc_pressure_kpa = 0.0f;
+	s_state.dc_pressure_voltage_v = 0.0f;
+	s_state.dc_pressure_valid = false;
 }
 
 static float select_process_temperature(const app_runtime_t *sample) {
@@ -177,6 +187,9 @@ static void ntc_filter_push_voltage_locked(ntc_filter_state_t *filter, uint8_t c
 
 static void sample_non_ntc_peripherals(app_runtime_t *sample) {
 	sample->wf_valid = false;
+	sample->dc_pressure_valid = false;
+	sample->dc_pressure_kpa = 0.0f;
+	sample->dc_pressure_voltage_v = 0.0f;
 
 #if FEATURE_VOLTAGE_MONITOR_ENABLE
 	// 电源检测每个控制周期采样一次。
@@ -184,6 +197,16 @@ static void sample_non_ntc_peripherals(app_runtime_t *sample) {
 	if (periph_adc_read_raw12(APP_EXT_ADC_CMD_VDETECT, &raw_vdet) == ESP_OK) {
 		sample->supply_voltage_v = periph_adc_calc_supply_voltage(raw_vdet);
 		sample->undervoltage = sample->supply_voltage_v < APP_UNDERVOLTAGE_THRESHOLD_V;
+	}
+#endif
+
+#if APP_PRESSURE_SOURCE_DC
+	// 读取 DC 电压型压力传感器。
+	periph_pressure_dc_sample_t pressure_sample = {0};
+	if (periph_pressure_dc_read(&pressure_sample) == ESP_OK) {
+		sample->dc_pressure_kpa = pressure_sample.pressure_kpa;
+		sample->dc_pressure_voltage_v = pressure_sample.voltage_v;
+		sample->dc_pressure_valid = true;
 	}
 #endif
 
@@ -263,6 +286,9 @@ static void sampling_task(void *arg) {
 			sensor_snapshot.wf_temp_c = slow_sample.wf_temp_c;
 			sensor_snapshot.wf_pressure_kpa = slow_sample.wf_pressure_kpa;
 			sensor_snapshot.wf_valid = slow_sample.wf_valid;
+			sensor_snapshot.dc_pressure_kpa = slow_sample.dc_pressure_kpa;
+			sensor_snapshot.dc_pressure_voltage_v = slow_sample.dc_pressure_voltage_v;
+			sensor_snapshot.dc_pressure_valid = slow_sample.dc_pressure_valid;
 			sensor_snapshot.supply_voltage_v = slow_sample.supply_voltage_v;
 			sensor_snapshot.undervoltage = slow_sample.undervoltage;
 			slow_sample_counter = 0;
@@ -277,6 +303,9 @@ static void sampling_task(void *arg) {
 		s_state.wf_temp_c = sensor_snapshot.wf_temp_c;
 		s_state.wf_pressure_kpa = sensor_snapshot.wf_pressure_kpa;
 		s_state.wf_valid = sensor_snapshot.wf_valid;
+		s_state.dc_pressure_kpa = sensor_snapshot.dc_pressure_kpa;
+		s_state.dc_pressure_voltage_v = sensor_snapshot.dc_pressure_voltage_v;
+		s_state.dc_pressure_valid = sensor_snapshot.dc_pressure_valid;
 		s_state.supply_voltage_v = sensor_snapshot.supply_voltage_v;
 		s_state.undervoltage = sensor_snapshot.undervoltage;
 		xSemaphoreGive(s_state_lock);
@@ -457,9 +486,22 @@ static void telemetry_task(void *arg) {
 		snapshot = s_state;
 		xSemaphoreGive(s_state_lock);
 
+		float pressure_kpa = 0.0f;
+		bool pressure_valid = false;
+		const char *pressure_src = "OFF";
+#if APP_PRESSURE_SOURCE_WF
+		pressure_kpa = snapshot.wf_pressure_kpa;
+		pressure_valid = snapshot.wf_valid;
+		pressure_src = "WF";
+#elif APP_PRESSURE_SOURCE_DC
+		pressure_kpa = snapshot.dc_pressure_kpa;
+		pressure_valid = snapshot.dc_pressure_valid;
+		pressure_src = "DC";
+#endif
+
 		// USB 日志实时输出。
 		ESP_LOGI(TAG,
-				 "T0=%.2f V0=%.3f T1=%.2f V1=%.3f T2=%.2f V2=%.3f T3=%.2f V3=%.3f WF_T=%.2f WF_P=%.2f V=%.2f PWMms=%.1f SP=%.2f SAFE=%d",
+				 "T0=%.2f V0=%.3f T1=%.2f V1=%.3f T2=%.2f V2=%.3f T3=%.2f V3=%.3f WF_T=%.2f P=%.2f Psrc=%s V=%.2f PWMms=%.1f SP=%.2f SAFE=%d",
 				 snapshot.ntc_temp_c[0],
 				 snapshot.ntc_voltage_v[0],
 				 snapshot.ntc_temp_c[1],
@@ -469,7 +511,8 @@ static void telemetry_task(void *arg) {
 				 snapshot.ntc_temp_c[3],
 				 snapshot.ntc_voltage_v[3],
 				 snapshot.wf_temp_c,
-				 snapshot.wf_pressure_kpa,
+				 pressure_valid ? pressure_kpa : NAN,
+				 pressure_src,
 				 snapshot.supply_voltage_v,
 				 snapshot.pwm_on_ms,
 				 snapshot.effective_setpoint_c,
@@ -490,7 +533,7 @@ static void telemetry_task(void *arg) {
 		}
 #endif
 
-#if FEATURE_WF5803F_ENABLE
+#if APP_PRESSURE_SOURCE_WF
 		// WF5803F 温压帧。
 		if (snapshot.wf_valid) {
 			uint8_t payload_wf[8] = {0};
@@ -498,6 +541,18 @@ static void telemetry_task(void *arg) {
 				snapshot.wf_temp_c, snapshot.wf_pressure_kpa, payload_wf, sizeof(payload_wf));
 			if (wf_len > 0) {
 				telemetry_send(COMM_CMD_WF5803F, payload_wf, wf_len);
+			}
+		}
+#endif
+
+#if APP_PRESSURE_SOURCE_DC
+		// DC 压力帧。
+		if (snapshot.dc_pressure_valid) {
+			uint8_t payload_p[4] = {0};
+			const size_t p_len = comm_protocol_pack_pressure_payload(
+				snapshot.dc_pressure_kpa, payload_p, sizeof(payload_p));
+			if (p_len > 0) {
+				telemetry_send(COMM_CMD_PRESSURE, payload_p, p_len);
 			}
 		}
 #endif

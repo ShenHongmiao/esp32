@@ -1,0 +1,35 @@
+#ifndef PRESSURE_CONFIG_H
+#define PRESSURE_CONFIG_H
+
+#include "app_config.h"
+
+// Derived pressure switches (hierarchy: enable -> source -> channel).
+#define APP_PRESSURE_ENABLE        (FEATURE_PRESSURE_ENABLE)
+#define APP_PRESSURE_SOURCE_WF     (FEATURE_PRESSURE_ENABLE && FEATURE_PRESSURE_SOURCE_WF)
+#define APP_PRESSURE_SOURCE_DC     (FEATURE_PRESSURE_ENABLE && FEATURE_PRESSURE_SOURCE_DC)
+#define APP_PRESSURE_DC_CH1        (APP_PRESSURE_SOURCE_DC && FEATURE_PRESSURE_DC_CH1)
+#define APP_PRESSURE_DC_CH2        (APP_PRESSURE_SOURCE_DC && FEATURE_PRESSURE_DC_CH2)
+
+#if FEATURE_PRESSURE_ENABLE
+    #if (FEATURE_PRESSURE_SOURCE_WF + FEATURE_PRESSURE_SOURCE_DC) != 1
+        #error "Select exactly one pressure source: WF or DC"
+    #endif
+    #if FEATURE_PRESSURE_SOURCE_WF && !FEATURE_WF5803F_ENABLE
+        #error "WF pressure requires FEATURE_WF5803F_ENABLE=1"
+    #endif
+    #if FEATURE_PRESSURE_SOURCE_DC
+        #if (FEATURE_PRESSURE_DC_CH1 + FEATURE_PRESSURE_DC_CH2) != 1
+            #error "Select exactly one DC pressure channel: CH1 or CH2"
+        #endif
+    #endif
+#endif
+
+#if APP_PRESSURE_SOURCE_DC
+    #if APP_PRESSURE_DC_CH1
+        #define APP_PRESSURE_DC_ADC_CMD APP_EXT_ADC_CMD_Press1
+    #else
+        #define APP_PRESSURE_DC_ADC_CMD APP_EXT_ADC_CMD_Press2
+    #endif
+#endif
+
+#endif  // PRESSURE_CONFIG_H
