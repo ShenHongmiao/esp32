@@ -4,6 +4,7 @@
 #include "freertos/task.h"
 
 #include "app_config.h"
+#include "pressure_config.h"
 #include "periph_i2c.h"
 
 // WF5803F 关键寄存器定义。
@@ -36,6 +37,12 @@ esp_err_t periph_wf5803f_read(float *temperature_c, float *pressure_kpa) {
     if (temperature_c == NULL || pressure_kpa == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
+
+#if !APP_PRESSURE_SOURCE_WF
+    *temperature_c = 0.0f;
+    *pressure_kpa = 0.0f;
+    return ESP_ERR_INVALID_STATE;
+#else
 
     // 写命令寄存器，启动单次温压联合测量。
     esp_err_t err = periph_i2c_write_reg(APP_WF5803F_USE_ADDR, WF5803F_REG_CMD, WF5803F_CMD_SINGLE_TP);
@@ -75,4 +82,5 @@ esp_err_t periph_wf5803f_read(float *temperature_c, float *pressure_kpa) {
     *pressure_kpa = wf5803f_pressure_from_raw24(press_raw);
     *temperature_c = wf5803f_temp_from_raw16(temp_raw);
     return ESP_OK;
+#endif
 }

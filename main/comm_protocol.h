@@ -32,6 +32,8 @@ uint8_t comm_protocol_crc8(const uint8_t *data, size_t len);
 size_t comm_protocol_build_frame(uint8_t cmd_id, const uint8_t *payload, uint8_t payload_len, uint8_t *out_frame, size_t out_cap);
 
 // 打包 NTC 温度载荷（按开关决定是否写入对应通道）。
+// 注意：该函数原用于打包 NTC0/1 物理通道数据，现已重构为打包 PWM CH0 和 PWM CH1 的控制反馈平均温度。
+// 入参中的 ch0_xxx 对应 PWM CH0 (NTC2/3)，ch1_xxx 对应 PWM CH1 (NTC0/1)。
 size_t comm_protocol_pack_ntc_payload(
     bool ch0_enable,
     float ch0_temp_c,
@@ -46,7 +48,7 @@ size_t comm_protocol_pack_wf_payload(float temperature_c, float pressure_kpa, ui
 // 打包系统电压载荷。
 size_t comm_protocol_pack_voltage_payload(float voltage_v, bool undervoltage, uint8_t *out_payload, size_t out_cap);
 
-// 打包 PID 输出载荷（单位：ms）。
+// 打包 PID 输出载荷（单位：ms），单路输出。
 size_t comm_protocol_pack_pid_out_payload(float pid_out_ms, uint8_t *out_payload, size_t out_cap);
 
 // 打包压力载荷（单位：kPa）。

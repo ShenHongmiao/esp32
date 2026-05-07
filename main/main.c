@@ -55,11 +55,11 @@ typedef struct {
 	float supply_voltage_v;
 	bool undervoltage;
 
-    // 控制相关运行态。
-	float process_temp_c;
+    // 控制相关运行态（双路 PID）。
+	float process_temp_c[2];
 	float requested_setpoint_c;
-	float effective_setpoint_c;
-	float pwm_on_ms;
+	float effective_setpoint_c[2];
+	float pwm_on_ms[2];
 
     // 上位机心跳时间戳与 OTA 请求标志。
 	uint32_t last_heartbeat_ms;
@@ -67,6 +67,19 @@ typedef struct {
 } app_runtime_t;
 
 static const char *TAG = "heater_app";
+
+#define APP_CONTROL_GROUPS 2
+
+typedef struct {
+	uint8_t primary_ntc;
+	uint8_t secondary_ntc;
+	uint8_t pwm_channel;
+} control_group_map_t;
+
+static const control_group_map_t s_group_map[APP_CONTROL_GROUPS] = {
+	{0, 1, 1},
+	{2, 3, 0},
+};
 
 #if APP_NTC_FILTER_WINDOW_SIZE < 1
 #error "APP_NTC_FILTER_WINDOW_SIZE must be >= 1"
@@ -87,7 +100,7 @@ typedef struct {
 
 static SemaphoreHandle_t s_state_lock;
 static app_runtime_t s_state;
-static ctrl_pid_t s_pid;
+static ctrl_pid_t s_pid[APP_CONTROL_GROUPS];
 static ctrl_failsafe_t s_failsafe;
 static ntc_filter_state_t s_ntc_filter;
 
@@ -109,31 +122,24 @@ static esp_err_t init_nvs(void) {
 static void runtime_init(void) {
 	// 初始化关键状态，确保控制器启动时有确定行为。
 	s_state.requested_setpoint_c = APP_DEFAULT_SETPOINT_C;
-	s_state.effective_setpoint_c = APP_DEFAULT_SETPOINT_C;
+	for (uint32_t group = 0; group < APP_CONTROL_GROUPS; ++group) {
+		s_state.effective_setpoint_c[group] = APP_DEFAULT_SETPOINT_C;
+		s_state.process_temp_c[group] = APP_DEFAULT_SETPOINT_C;
+		s_state.pwm_on_ms[group] = 0.0f;
+	}
 	s_state.last_heartbeat_ms = app_now_ms();
-	s_state.process_temp_c = APP_DEFAULT_SETPOINT_C;
-	s_state.pwm_on_ms = 0.0f;
 	s_state.dc_pressure_kpa = 0.0f;
 	s_state.dc_pressure_voltage_v = 0.0f;
 	s_state.dc_pressure_valid = false;
 }
 
-static float select_process_temperature(const app_runtime_t *sample) {
-	// 控制温度源优先级：NTC0 > NTC1 > NTC2 > NTC3 > WF5803F。
-	if (sample->ntc_valid[0]) {
-		return sample->ntc_temp_c[0];
+static float select_process_temperature_group(const app_runtime_t *sample, uint8_t primary, uint8_t secondary) {
+	// 控制温度源优先级：主通道优先，备用通道回退。
+	if (sample->ntc_valid[primary]) {
+		return sample->ntc_temp_c[primary];
 	}
-	if (sample->ntc_valid[1]) {
-		return sample->ntc_temp_c[1];
-	}
-	if (sample->ntc_valid[2]) {
-		return sample->ntc_temp_c[2];
-	}
-	if (sample->ntc_valid[3]) {
-		return sample->ntc_temp_c[3];
-	}
-	if (sample->wf_valid) {
-		return sample->wf_temp_c;
+	if (sample->ntc_valid[secondary]) {
+		return sample->ntc_temp_c[secondary];
 	}
 	return NAN;
 }
@@ -332,19 +338,27 @@ static void apply_command(const comm_command_t *cmd) {
 			s_state.requested_setpoint_c = cmd->value;
 			break;
 		case COMM_COMMAND_KP:
-			s_pid.kp = cmd->value;
+			for (uint32_t group = 0; group < APP_CONTROL_GROUPS; ++group) {
+				s_pid[group].kp = cmd->value;
+			}
 			break;
 		case COMM_COMMAND_KI:
-			if (s_pid.ki != cmd->value) {
-				s_pid.ki = cmd->value;
-				s_pid.integral = 0.0f;
+			for (uint32_t group = 0; group < APP_CONTROL_GROUPS; ++group) {
+				if (s_pid[group].ki != cmd->value) {
+					s_pid[group].ki = cmd->value;
+					s_pid[group].integral = 0.0f;
+				}
 			}
 			break;
 		case COMM_COMMAND_KD:
-			s_pid.kd = cmd->value;
+			for (uint32_t group = 0; group < APP_CONTROL_GROUPS; ++group) {
+				s_pid[group].kd = cmd->value;
+			}
 			break;
 		case COMM_COMMAND_ILIMIT:
-			ctrl_pid_set_integral_limit(&s_pid, cmd->value);
+			for (uint32_t group = 0; group < APP_CONTROL_GROUPS; ++group) {
+				ctrl_pid_set_integral_limit(&s_pid[group], cmd->value);
+			}
 			break;
 		case COMM_COMMAND_OTA:
 			s_state.ota_pending = true;
@@ -353,17 +367,28 @@ static void apply_command(const comm_command_t *cmd) {
 			break;
 	}
 
+	const float sp = s_state.requested_setpoint_c;
+	const float kp0 = s_pid[0].kp;
+	const float ki0 = s_pid[0].ki;
+	const float kd0 = s_pid[0].kd;
+	const float kp1 = s_pid[1].kp;
+	const float ki1 = s_pid[1].ki;
+	const float kd1 = s_pid[1].kd;
+
 	xSemaphoreGive(s_state_lock);
 
 	// 打印命令和当前关键参数，便于联调追踪。
 	ESP_LOGI(TAG,
-			 "cmd=%d value=%.3f sp=%.2f kp=%.2f ki=%.2f kd=%.2f",
+			 "cmd=%d value=%.3f sp=%.2f kp0=%.2f ki0=%.2f kd0=%.2f kp1=%.2f ki1=%.2f kd1=%.2f",
 			 cmd->type,
 			 cmd->value,
-			 s_state.requested_setpoint_c,
-			 s_pid.kp,
-			 s_pid.ki,
-			 s_pid.kd);
+			 sp,
+			 kp0,
+			 ki0,
+			 kd0,
+			 kp1,
+			 ki1,
+			 kd1);
 }
 
 static void control_task(void *arg) {
@@ -377,8 +402,10 @@ static void control_task(void *arg) {
 
 	// 任务启动后再加载运行 PID 参数：上电阶段保持 0 输出，进入控制任务后才启用调参值。
 	xSemaphoreTake(s_state_lock, portMAX_DELAY);
-	ctrl_pid_set_gains(&s_pid, APP_PID_TASK_START_KP, APP_PID_TASK_START_KI, APP_PID_TASK_START_KD);
-	ctrl_pid_reset(&s_pid);
+	for (uint32_t group = 0; group < APP_CONTROL_GROUPS; ++group) {
+		ctrl_pid_set_gains(&s_pid[group], APP_PID_TASK_START_KP, APP_PID_TASK_START_KI, APP_PID_TASK_START_KD);
+		ctrl_pid_reset(&s_pid[group]);
+	}
 	xSemaphoreGive(s_state_lock);
 	ESP_LOGI(TAG,
 			 "pid task start gains: kp=%.2f ki=%.2f kd=%.2f",
@@ -415,7 +442,6 @@ static void control_task(void *arg) {
 		xSemaphoreGive(s_state_lock);
 
 		// 2) 选择控制温度源并计算失联保护后的有效设定值。
-		const float process_temp = select_process_temperature(&sample);
 		float effective_sp = requested_sp;
 #if FEATURE_WIRELESS_ENABLE
 		#if FEATURE_HEARTBEAT_FAILSAFE_ENABLE
@@ -430,33 +456,56 @@ static void control_task(void *arg) {
 		s_failsafe.safe_mode = false;
 #endif
 
-		// 3) 温度有效时执行 PID；否则直接关断 PWM。
-		float pwm_on_ms = 0.0f;
-		if (isfinite(process_temp)) {
-			xSemaphoreTake(s_state_lock, portMAX_DELAY);
-			ctrl_pid_set_setpoint(&s_pid, effective_sp);
-			pwm_on_ms = ctrl_pid_update(&s_pid, process_temp, dt_s, NULL);
-
-			// 欠压或 OTA 挂起期间，强制输出为 0。
-			if (sample.undervoltage || ota_pending) {
-				pwm_on_ms = 0.0f;
+		float process_temp[APP_CONTROL_GROUPS] = {NAN, NAN};
+		bool process_valid[APP_CONTROL_GROUPS] = {false, false};
+		for (uint32_t group = 0; group < APP_CONTROL_GROUPS; ++group) {
+			float sum = 0.0f;
+			int count = 0;
+			const uint8_t primary = s_group_map[group].primary_ntc;
+			const uint8_t secondary = s_group_map[group].secondary_ntc;
+			if (sample.ntc_valid[primary]) {
+				sum += sample.ntc_temp_c[primary];
+				count++;
 			}
-
-			s_state.process_temp_c = process_temp;
-			s_state.effective_setpoint_c = effective_sp;
-			s_state.pwm_on_ms = pwm_on_ms;
-			xSemaphoreGive(s_state_lock);
-		} else {
-			periph_pwm_force_off();
-			xSemaphoreTake(s_state_lock, portMAX_DELAY);
-			s_state.pwm_on_ms = 0.0f;
-			xSemaphoreGive(s_state_lock);
-			vTaskDelayUntil(&sys_tick_count_ctrl, control_period_ticks);
-			continue;
+			if (sample.ntc_valid[secondary]) {
+				sum += sample.ntc_temp_c[secondary];
+				count++;
+			}
+			if (count > 0) {
+				process_temp[group] = sum / (float)count;
+				process_valid[group] = true;
+			}
 		}
 
+		// 3) 温度有效时执行 PID；无效通道仅关断对应 PWM。
+		float pwm_on_ms[APP_CONTROL_GROUPS] = {0.0f, 0.0f};
+		xSemaphoreTake(s_state_lock, portMAX_DELAY);
+		for (uint32_t group = 0; group < APP_CONTROL_GROUPS; ++group) {
+			if (process_valid[group]) {
+				ctrl_pid_set_setpoint(&s_pid[group], effective_sp);
+				pwm_on_ms[group] = ctrl_pid_update(&s_pid[group], process_temp[group], dt_s, NULL);
+
+				// 欠压或 OTA 挂起期间，强制输出为 0。
+				if (sample.undervoltage || ota_pending) {
+					pwm_on_ms[group] = 0.0f;
+				}
+			}
+
+			s_state.process_temp_c[group] = process_temp[group];
+			s_state.effective_setpoint_c[group] = effective_sp;
+			s_state.pwm_on_ms[group] = pwm_on_ms[group];
+		}
+		xSemaphoreGive(s_state_lock);
+
 		// 4) 将控制输出写入 PWM 驱动。
-		periph_pwm_set_on_time_ms(pwm_on_ms);
+		for (uint32_t group = 0; group < APP_CONTROL_GROUPS; ++group) {
+			const uint8_t pwm_channel = s_group_map[group].pwm_channel;
+			if (process_valid[group]) {
+				periph_pwm_set_on_time_ms_ch(pwm_channel, pwm_on_ms[group]);
+			} else {
+				periph_pwm_force_off_ch(pwm_channel);
+			}
+		}
 		vTaskDelayUntil(&sys_tick_count_ctrl, control_period_ticks);
 	}
 }
@@ -501,7 +550,7 @@ static void telemetry_task(void *arg) {
 
 		// USB 日志实时输出。
 		ESP_LOGI(TAG,
-				 "T0=%.2f V0=%.3f T1=%.2f V1=%.3f T2=%.2f V2=%.3f T3=%.2f V3=%.3f WF_T=%.2f P=%.2f Psrc=%s V=%.2f PWMms=%.1f SP=%.2f SAFE=%d",
+				 "T0=%.2f V0=%.3f T1=%.2f V1=%.3f T2=%.2f V2=%.3f T3=%.2f V3=%.3f WF_T=%.2f P=%.2f Psrc=%s V=%.2f PWM0=%.1f PWM1=%.1f SP0=%.2f SP1=%.2f SAFE=%d",
 				 snapshot.ntc_temp_c[0],
 				 snapshot.ntc_voltage_v[0],
 				 snapshot.ntc_temp_c[1],
@@ -514,18 +563,63 @@ static void telemetry_task(void *arg) {
 				 pressure_valid ? pressure_kpa : NAN,
 				 pressure_src,
 				 snapshot.supply_voltage_v,
-				 snapshot.pwm_on_ms,
-				 snapshot.effective_setpoint_c,
+				 snapshot.pwm_on_ms[0],
+				 snapshot.pwm_on_ms[1],
+				 snapshot.effective_setpoint_c[0],
+				 snapshot.effective_setpoint_c[1],
 				 s_failsafe.safe_mode);
 
-#if FEATURE_NTC_CH0_ENABLE || FEATURE_NTC_CH1_ENABLE
-		// NTC 数据帧。
+#if FEATURE_NTC_CH0_ENABLE || FEATURE_NTC_CH1_ENABLE || FEATURE_NTC_CH2_ENABLE || FEATURE_NTC_CH3_ENABLE
+		// NTC 数据帧：改为上报 PWM 通道的平均反馈温度。
+		float pwm_ch1_avg = 0.0f;
+		bool pwm_ch1_valid = false;
+		float pwm_ch0_avg = 0.0f;
+		bool pwm_ch0_valid = false;
+
+		float sum = 0.0f;
+		int count = 0;
+#if FEATURE_NTC_CH0_ENABLE
+		if (snapshot.ntc_valid[0]) {
+			sum += snapshot.ntc_temp_c[0];
+			count++;
+		}
+#endif
+#if FEATURE_NTC_CH1_ENABLE
+		if (snapshot.ntc_valid[1]) {
+			sum += snapshot.ntc_temp_c[1];
+			count++;
+		}
+#endif
+		if (count > 0) {
+			pwm_ch1_avg = sum / (float)count;
+			pwm_ch1_valid = true;
+		}
+
+		sum = 0.0f;
+		count = 0;
+#if FEATURE_NTC_CH2_ENABLE
+		if (snapshot.ntc_valid[2]) {
+			sum += snapshot.ntc_temp_c[2];
+			count++;
+		}
+#endif
+#if FEATURE_NTC_CH3_ENABLE
+		if (snapshot.ntc_valid[3]) {
+			sum += snapshot.ntc_temp_c[3];
+			count++;
+		}
+#endif
+		if (count > 0) {
+			pwm_ch0_avg = sum / (float)count;
+			pwm_ch0_valid = true;
+		}
+
 		uint8_t payload_ntc[8] = {0};
 		const size_t ntc_len = comm_protocol_pack_ntc_payload(
-			FEATURE_NTC_CH0_ENABLE && snapshot.ntc_valid[0],
-			snapshot.ntc_temp_c[0],
-			FEATURE_NTC_CH1_ENABLE && snapshot.ntc_valid[1],
-			snapshot.ntc_temp_c[1],
+			pwm_ch0_valid,
+			pwm_ch0_avg,
+			pwm_ch1_valid,
+			pwm_ch1_avg,
 			payload_ntc,
 			sizeof(payload_ntc));
 		if (ntc_len > 0) {
@@ -569,9 +663,20 @@ static void telemetry_task(void *arg) {
 
 #if FEATURE_PID_OUT_ENABLE
 		// PID 输出帧（ms）。
-		uint8_t payload_pid[4] = {0};
-		const size_t pid_len = comm_protocol_pack_pid_out_payload(
-			snapshot.pwm_on_ms, payload_pid, sizeof(payload_pid));
+		uint8_t payload_pid[8] = {0};
+		size_t pid_len = comm_protocol_pack_pid_out_payload(
+			snapshot.pwm_on_ms[1], payload_pid, sizeof(payload_pid));
+		if (pid_len == 4) {
+			const size_t pid_len2 = comm_protocol_pack_pid_out_payload(
+				snapshot.pwm_on_ms[0], payload_pid + pid_len, sizeof(payload_pid) - pid_len);
+			if (pid_len2 == 4) {
+				pid_len += pid_len2;
+			} else {
+				pid_len = 0;
+			}
+		} else {
+			pid_len = 0;
+		}
 		if (pid_len > 0) {
 			telemetry_send(COMM_CMD_PID_OUT, payload_pid, pid_len);
 		}
@@ -628,17 +733,27 @@ static void ota_task(void *arg) {
 	while (1) {
 		// 读取并消费一次 OTA 请求标志。
 		bool start_ota = false;
-		float current_temp_c = 0.0f;
+		float temp_samples[APP_CONTROL_GROUPS] = {NAN, NAN};
 
 		xSemaphoreTake(s_state_lock, portMAX_DELAY);
 		if (s_state.ota_pending) {
 			start_ota = true;
-			current_temp_c = s_state.process_temp_c;
+			temp_samples[0] = s_state.process_temp_c[0];
+			temp_samples[1] = s_state.process_temp_c[1];
 			s_state.ota_pending = false;
 		}
 		xSemaphoreGive(s_state_lock);
 
 		if (start_ota) {
+			float current_temp_c = NAN;
+			if (isfinite(temp_samples[0])) {
+				current_temp_c = temp_samples[0];
+			}
+			if (isfinite(temp_samples[1])) {
+				if (!isfinite(current_temp_c) || temp_samples[1] > current_temp_c) {
+					current_temp_c = temp_samples[1];
+				}
+			}
 			// 在安全温度下执行 OTA，失败仅记录日志。
 			const esp_err_t err = sys_ota_perform_if_safe(APP_OTA_URL, current_temp_c);
 			if (err != ESP_OK) {
@@ -668,13 +783,15 @@ void app_main(void) {
 	// 3) 初始化运行态与控制参数。
 	runtime_init();
 	// 上电固定为 0/0/0，确保烧录与启动阶段不输出控制量。
-	ctrl_pid_init(
-		&s_pid,
-		0.0f,
-		0.0f,
-		0.0f,
-		APP_DEFAULT_SETPOINT_C);
-	ctrl_pid_set_integral_limit(&s_pid, APP_PID_ILIMIT_DEFAULT);
+	for (uint32_t group = 0; group < APP_CONTROL_GROUPS; ++group) {
+		ctrl_pid_init(
+			&s_pid[group],
+			0.0f,
+			0.0f,
+			0.0f,
+			APP_DEFAULT_SETPOINT_C);
+		ctrl_pid_set_integral_limit(&s_pid[group], APP_PID_ILIMIT_DEFAULT);
+	}
 	ctrl_failsafe_init(&s_failsafe, APP_HEARTBEAT_TIMEOUT_MS, APP_SAFE_SETPOINT_C);
 
 	// 4) 初始化外设。

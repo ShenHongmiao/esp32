@@ -12,15 +12,15 @@
 
 // ======================== Feature Switches ========================
 // 功能总开关：采集与上传使用同一组使能，避免“采了但没发”或“发了无数据”。
-#define FEATURE_NTC_CH0_ENABLE            0 // NTC 通道 0 使能，ADC_CH1，下侧分压测温
+#define FEATURE_NTC_CH0_ENABLE            1 // NTC 通道 0 使能，ADC_CH1，下侧分压测温
 #define FEATURE_NTC_CH1_ENABLE            0 // NTC 通道 1 使能, ADC_CH2
 #define FEATURE_NTC_CH2_ENABLE            0 // NTC 通道 2 使能, ADC_CH3
 #define FEATURE_NTC_CH3_ENABLE            0 // NTC 通道 3 使能
 #define FEATURE_WF5803F_ENABLE            0 // WF5803F 功能使能
-#define FEATURE_PRESSURE_ENABLE           1 // 气压检测总开关：1=启用；0=关闭
-#define FEATURE_PRESSURE_SOURCE_WF        0 // 气压来源：1=WF5803F
-#define FEATURE_PRESSURE_SOURCE_DC        1 // 气压来源：1=外部 DC 电压型
-#define FEATURE_PRESSURE_DC_CH1           1 // DC 通道 1 选择
+#define FEATURE_PRESSURE_ENABLE           0 // 气压检测总开关：1=启用；0=关闭
+// 气压来源选择：0=外部 DC 电压型，1=WF5803F
+#define FEATURE_PRESSURE_SOURCE           0
+#define FEATURE_PRESSURE_DC_CH1           0 // DC 通道 1 选择
 #define FEATURE_PRESSURE_DC_CH2           0 // DC 通道 2 选择
 #define FEATURE_VOLTAGE_MONITOR_ENABLE    1 // 监测电压并上报，必要时触发保护
 #define FEATURE_PID_OUT_ENABLE            1 // 发送 PID 输出值
@@ -29,7 +29,9 @@
 #define FEATURE_WIRELESS_ENABLE           1 // 有线调试建议设为 0，避免无线重连导致调试干扰
 // 心跳失联保护开关：1=启用超时降级到安全温度；0=忽略心跳超时。
 #define FEATURE_HEARTBEAT_FAILSAFE_ENABLE 0
-
+//PWM通道使能
+#define APP_PWM_CH0_ENABLE               0 // PWM CH0 开关：1=使能输出，0=禁用，对应NTC通道
+#define APP_PWM_CH1_ENABLE               1 // PWM CH1 开关：1=使能输出，0=禁用
 // ======================== Control Loop ============================
 // 控制任务周期（毫秒）：越小响应越快，但 CPU 占用和噪声敏感度越高。也是其他任务（如采样、通信）的时间基准。
 #define APP_CONTROL_PERIOD_MS             20
@@ -70,8 +72,6 @@
 #define APP_I2C_FREQ_HZ                   400000      // I2C 时钟频率（Hz），400kHz 属于高速模式，适合大多数传感器。
 
 // PWM 输出定义：双通道同占空比输出到两路 NMOS 栅极。
-#define APP_PWM_CH0_ENABLE               0 // PWM CH0 开关：1=使能输出，0=禁用
-#define APP_PWM_CH1_ENABLE               1 // PWM CH1 开关：1=使能输出，0=禁用
 #define APP_PWM_GPIO_CH0                  GPIO_NUM_4
 #define APP_PWM_GPIO_CH1                  GPIO_NUM_5
 #define APP_PWM_FREQ_HZ                   20000 // PWM 频率（Hz），20kHz 以上通常不可闻，适合加热控制。
@@ -80,7 +80,7 @@
 // ======================== External ADC ============================
 // 外部 ADC 地址与各通道命令字（来自需求文档定义）。
 #define APP_EXT_ADC_ADDR                  0x48
-#define APP_EXT_ADC_CMD_VDETECT           0xE4 
+#define APP_EXT_ADC_CMD_VDETECT           0x84 
 #define APP_EXT_ADC_CMD_NTC0              0xC4
 #define APP_EXT_ADC_CMD_NTC1              0x94
 #define APP_EXT_ADC_CMD_NTC2              0xD4

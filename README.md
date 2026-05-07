@@ -1,6 +1,6 @@
 # ESP32-S3 加热控制系统
 
-本项目基于 ESP32-S3 实现多路温度采样 + PID 控制 + PWM 加热输出 + UDP/串口通讯 + OTA 更新。整体设计将采样、控制、通讯、OTA 解耦成多个任务，关键参数集中在 `main/app_config.h` 统一管理。
+本项目基于 ESP32-S3 实现多路温度采样 + 双路 PID 控制 + 双路 PWM 加热输出 + UDP/串口通讯 + OTA 更新，并支持压力传感器（WF5803F 或外部 DC 电压型）。整体设计将采样、控制、通讯、OTA 解耦成多个任务，关键参数集中在 `main/app_config.h` 统一管理。
 
 ## 1. 硬件与分区概览
 
@@ -40,6 +40,7 @@
 - `comm_protocol.*`：帧协议封装、CRC8、载荷打包
 - `comm_command.*`：文本命令解析（串口/UDP 共用）
 - `comm_udp.*`：WiFi STA + UDP 发送/接收
+- `periph_pressure_dc.*`：外部 DC 电压型压力传感器
 - `sys_ota.*`：OTA 触发与温度安全门禁
 
 `CMakeLists.txt` 与 `main/CMakeLists.txt` 已注册全部源文件与组件依赖。
@@ -49,7 +50,7 @@
 ### 3.1 任务划分
 
 - `sampling_task`：高速采样 NTC 电压，维护滑动平均
-- `control_task`：固定周期 PID 控制，输出 PWM 导通时间
+- `control_task`：固定周期双路 PID 控制，输出对应 PWM 导通时间
 - `telemetry_task`：周期输出日志并（可选）UDP 上报
 - `udp_command_task`：接收 UDP 命令并更新控制参数
 - `console_command_task`：USB 串口命令解析
@@ -59,8 +60,15 @@
 
 - 传感器采样与控制状态通过互斥锁保护
 - `sampling_task` 更新共享状态
-- `control_task` 读取快照后计算 PID
+- `control_task` 读取快照后计算双路 PID
 - `telemetry_task` 读取快照后组帧输出
+
+### 3.3 双路控制映射
+
+- PWM1：NTC0/NTC1（优先级 0 > 1）-> PID -> PWM CH1 (`APP_PWM_GPIO_CH1`)
+- PWM0：NTC2/NTC3（优先级 2 > 3）-> PID -> PWM CH0 (`APP_PWM_GPIO_CH0`)
+- 上位机命令的设定值与 PID 参数目前对两路共享，但控制输出分别独立计算
+- 控制温度采用与遥测一致的平均规则：双通道都有效取平均，单通道有效取单通道值
 
 ## 4. 统一配置（app_config.h）
 
@@ -68,6 +76,9 @@
 
 - `FEATURE_NTC_CHx_ENABLE`：NTC 通道使能
 - `FEATURE_WF5803F_ENABLE`：温压传感器
+- `FEATURE_PRESSURE_ENABLE`：压力检测总开关
+- `FEATURE_PRESSURE_SOURCE`：压力来源选择（0=DC 电压型，1=WF5803F）
+- `FEATURE_PRESSURE_DC_CH1/CH2`：DC 压力通道选择
 - `FEATURE_VOLTAGE_MONITOR_ENABLE`：电压监测
 - `FEATURE_PID_OUT_ENABLE`：PID 输出上报
 - `FEATURE_UPLOAD_ENABLE`：UDP 上报
@@ -85,7 +96,7 @@
 
 - 默认上电 `Kp/Ki/Kd` 固定为 0
 - `APP_PID_TASK_START_KP/KI/KD` 为控制任务启动后的参数
-- 输出范围固定为 0~1000ms
+- 输出范围固定为 0~1000ms（每路独立）
 
 ## 5. I2C 与外设地址
 
@@ -154,6 +165,8 @@ raw12 = ((Byte0 & 0x0F) << 8) | Byte1
 - `NTC1`：CH2（0x94）
 - `NTC2`：CH3（0xD4）
 - `NTC3`：CH4（0xA4）
+- `PRESSURE_DC_CH1`：CH7（0xF4）
+- `PRESSURE_DC_CH2`：CH0（0x84）
 
 ### 6.4 电压与输入电压换算
 
@@ -206,15 +219,21 @@ $$P_{kPa} = \frac{180}{0.81} \cdot \left(\frac{raw}{2^{23}} - 0.1\right) + 30$$
 
 $$T_{c} = \frac{raw}{256}$$
 
-## 9. PWM 输出
+## 9. DC 电压型压力传感器
+
+- 电压模型：$V_{out} = 0.0188 \cdot P + 0.2$
+- 若传感器输出经分压后进入 ADC，则采样电压需乘以 `APP_PRESSURE_DC_VOUT_SCALE` 还原
+- 压力换算：$P_{kPa} = \frac{V_{out} - 0.2}{0.0188}$
+
+## 10. PWM 输出
 
 - LEDC 低速定时器，频率 20kHz
-- PID 输出范围：0~1000ms
-- 通过 `periph_pwm_set_on_time_ms()` 写入导通时间
+- PID 输出范围：0~1000ms（双路独立）
+- 通过 `periph_pwm_set_on_time_ms_ch()` 写入单路导通时间
 
-## 10. 通讯协议
+## 11. 通讯协议
 
-### 10.1 帧结构
+### 11.1 帧结构
 
 ```
 HEAD(0xDE) + CMD + LEN + PAYLOAD + CRC8 + TAIL(0xED)
@@ -224,17 +243,23 @@ HEAD(0xDE) + CMD + LEN + PAYLOAD + CRC8 + TAIL(0xED)
 - 数据缩放：浮点放大 100 倍转整数
 - CRC8：多项式 0x07，覆盖 HEAD 至 PAYLOAD
 
-### 10.2 CMD ID 与载荷
+### 11.2 CMD ID 与载荷
 
 | CMD | 宏 | 描述 | 载荷格式 |
 | --- | --- | --- | --- |
-| 0x01 | CMD_NTC | NTC 温度 | int16_t×100，通道可选 |
+| 0x01 | CMD_NTC | NTC 温度 | int16_t×100，通道可选（PWM CH0/CH1 平均温度） |
 | 0x02 | CMD_WF5803F | 温度+压力 | int16_t + int32_t |
 | 0x03 | CMD_VOLTAGE | 电压状态 | int16_t + uint8_t |
-| 0x04 | CMD_PID_OUT | PID 输出 | int32_t（ms×100） |
+| 0x04 | CMD_PID_OUT | PID 输出 | int32_t×2（ms×100，顺序为 PWM CH0 -> PWM CH1） |
+| 0x05 | CMD_PRESSURE | 压力数据 | int32_t（kPa×100） |
 | 0x0F | CMD_TEXT_INFO | 文本信息 | ASCII 字符串 |
 
-## 11. 命令输入（USB/UDP）
+说明：
+- `CMD_NTC` 中的 CH0/CH1 为逻辑通道：CH0=PWM0(由 NTC2/NTC3 平均)，CH1=PWM1(由 NTC0/NTC1 平均)
+- 平均规则：双通道都有效取平均，单通道有效取单通道值，均无效则不上报
+- `CMD_PID_OUT` 的两路输出按 PWM CH0 -> PWM CH1 顺序打包
+
+## 12. 命令输入（USB/UDP）
 
 支持文本命令（大小写不敏感）：
 
@@ -246,18 +271,18 @@ HEAD(0xDE) + CMD + LEN + PAYLOAD + CRC8 + TAIL(0xED)
 - `KD=xx`
 - `ILIMIT=xx` / `INTEGRAL_LIMIT=xx`
 
-## 12. OTA 策略
+## 13. OTA 策略
 
 - OTA URL 由 `APP_OTA_URL` 提供
 - 高温门禁：超过 `APP_OTA_SAFE_TEMP_C` 禁止 OTA
 - 进入 OTA 前强制关闭 PWM 输出
 
-## 13. 构建与烧录
+## 14. 构建与烧录
 
 - 建议使用 VS Code + ESP-IDF 插件执行 Build/Flash/Monitor
 - 目标芯片：ESP32-S3
 
-## 14. 常见问题排查
+## 15. 常见问题排查
 
 1. **WF5803F 无输出**
    - 确认 I2C 地址为 7-bit（0x6C/0x6D），而非 8-bit

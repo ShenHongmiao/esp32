@@ -14,5 +14,5 @@
     "--compile-commands-dir=e:\\program_C\\ESP32\\sample_project\\build"
   ],
   "idf.flashType": "UART",
-  "idf.portWin": "COM3"
+  "idf.portWin": "COM6"
 }
