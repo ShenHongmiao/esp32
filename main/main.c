@@ -103,6 +103,9 @@ static app_runtime_t s_state;
 static ctrl_pid_t s_pid[APP_CONTROL_GROUPS];
 static ctrl_failsafe_t s_failsafe;
 static ntc_filter_state_t s_ntc_filter;
+static uint8_t s_cyclic_stage[APP_CONTROL_GROUPS] = {1, 1};
+static uint32_t s_cyclic_hold_start_ms[APP_CONTROL_GROUPS];
+static float s_last_target_sp[APP_CONTROL_GROUPS] = {APP_DEFAULT_SETPOINT_C, APP_DEFAULT_SETPOINT_C};
 
 static uint32_t app_now_ms(void) {
 	// 统一使用 esp_timer 提供的微秒计时，再转换为毫秒。
@@ -126,6 +129,7 @@ static void runtime_init(void) {
 		s_state.effective_setpoint_c[group] = APP_DEFAULT_SETPOINT_C;
 		s_state.process_temp_c[group] = APP_DEFAULT_SETPOINT_C;
 		s_state.pwm_on_ms[group] = 0.0f;
+		s_last_target_sp[group] = APP_DEFAULT_SETPOINT_C;
 	}
 	s_state.last_heartbeat_ms = app_now_ms();
 	s_state.dc_pressure_kpa = 0.0f;
@@ -159,6 +163,39 @@ static void ntc_filter_reset(ntc_filter_state_t *filter) {
 			filter->voltage_ring[ch][i] = 0.0f;
 		}
 	}
+}
+
+static float update_cyclic_setpoint_group(uint32_t group,
+									float stage1_setpoint,
+									float process_temp,
+									bool process_valid) {
+	const uint32_t now_ms = app_now_ms();
+	float target = (s_cyclic_stage[group] == 2U) ? APP_CYCLIC_SETPOINT2_C : stage1_setpoint;
+	bool stable = process_valid;
+
+	if (stable) {
+		if (fabsf(process_temp - target) > APP_CYCLIC_HOLD_THRESHOLD_C) {
+			stable = false;
+		}
+	}
+
+	if (APP_CYCLIC_HOLD_TIME_MS == 0U) {
+		stable = false;
+	}
+
+	if (stable) {
+		if (s_cyclic_hold_start_ms[group] == 0U) {
+			s_cyclic_hold_start_ms[group] = now_ms;
+		} else if ((now_ms - s_cyclic_hold_start_ms[group]) >= APP_CYCLIC_HOLD_TIME_MS) {
+			s_cyclic_stage[group] = (s_cyclic_stage[group] == 1U) ? 2U : 1U;
+			s_cyclic_hold_start_ms[group] = 0U;
+			target = (s_cyclic_stage[group] == 2U) ? APP_CYCLIC_SETPOINT2_C : stage1_setpoint;
+		}
+	} else {
+		s_cyclic_hold_start_ms[group] = 0U;
+	}
+
+	return target;
 }
 
 static bool sample_ntc_voltage_channel(uint8_t channel, uint8_t adc_cmd, float *out_voltage_v) {
@@ -441,21 +478,7 @@ static void control_task(void *arg) {
 		requested_sp = s_state.requested_setpoint_c;
 		xSemaphoreGive(s_state_lock);
 
-		// 2) 选择控制温度源并计算失联保护后的有效设定值。
-		float effective_sp = requested_sp;
-#if FEATURE_WIRELESS_ENABLE
-		#if FEATURE_HEARTBEAT_FAILSAFE_ENABLE
-			const uint32_t now_ms = app_now_ms();
-			effective_sp = ctrl_failsafe_effective_setpoint(&s_failsafe, now_ms, last_hb, requested_sp);
-		#else
-			// 关闭心跳失联保护时，始终采用请求设定值。
-			s_failsafe.safe_mode = false;
-		#endif
-#else
-		// 无线上位机关闭时不依赖心跳，避免单机调试被误判为失联保护。
-		s_failsafe.safe_mode = false;
-#endif
-
+		// 2) 选择控制温度源并计算当前过程温度。
 		float process_temp[APP_CONTROL_GROUPS] = {NAN, NAN};
 		bool process_valid[APP_CONTROL_GROUPS] = {false, false};
 		for (uint32_t group = 0; group < APP_CONTROL_GROUPS; ++group) {
@@ -477,12 +500,56 @@ static void control_task(void *arg) {
 			}
 		}
 
-		// 3) 温度有效时执行 PID；无效通道仅关断对应 PWM。
+		// 3) 计算每路目标设定值与失联保护后的有效设定值。
+		float target_sp[APP_CONTROL_GROUPS] = {requested_sp, requested_sp};
+		float effective_sp[APP_CONTROL_GROUPS] = {requested_sp, requested_sp};
+#if FEATURE_HEATING_MODE == 2
+		for (uint32_t group = 0; group < APP_CONTROL_GROUPS; ++group) {
+			target_sp[group] = update_cyclic_setpoint_group(
+				group,
+				requested_sp,
+				process_temp[group],
+				process_valid[group]);
+		}
+#endif
+		for (uint32_t group = 0; group < APP_CONTROL_GROUPS; ++group) {
+			if (target_sp[group] != s_last_target_sp[group]) {
+				ctrl_pid_reset(&s_pid[group]);
+				s_last_target_sp[group] = target_sp[group];
+			}
+		}
+
+#if FEATURE_WIRELESS_ENABLE
+		#if FEATURE_HEARTBEAT_FAILSAFE_ENABLE
+			const uint32_t now_ms = app_now_ms();
+			for (uint32_t group = 0; group < APP_CONTROL_GROUPS; ++group) {
+				effective_sp[group] = ctrl_failsafe_effective_setpoint(
+					&s_failsafe,
+					now_ms,
+					last_hb,
+					target_sp[group]);
+			}
+		#else
+			// 关闭心跳失联保护时，始终采用请求设定值。
+			s_failsafe.safe_mode = false;
+			for (uint32_t group = 0; group < APP_CONTROL_GROUPS; ++group) {
+				effective_sp[group] = target_sp[group];
+			}
+		#endif
+#else
+		// 无线上位机关闭时不依赖心跳，避免单机调试被误判为失联保护。
+		s_failsafe.safe_mode = false;
+		for (uint32_t group = 0; group < APP_CONTROL_GROUPS; ++group) {
+			effective_sp[group] = target_sp[group];
+		}
+#endif
+
+		// 4) 温度有效时执行 PID；无效通道仅关断对应 PWM。
 		float pwm_on_ms[APP_CONTROL_GROUPS] = {0.0f, 0.0f};
 		xSemaphoreTake(s_state_lock, portMAX_DELAY);
 		for (uint32_t group = 0; group < APP_CONTROL_GROUPS; ++group) {
 			if (process_valid[group]) {
-				ctrl_pid_set_setpoint(&s_pid[group], effective_sp);
+				ctrl_pid_set_setpoint(&s_pid[group], effective_sp[group]);
 				pwm_on_ms[group] = ctrl_pid_update(&s_pid[group], process_temp[group], dt_s, NULL);
 
 				// 欠压或 OTA 挂起期间，强制输出为 0。
@@ -492,12 +559,12 @@ static void control_task(void *arg) {
 			}
 
 			s_state.process_temp_c[group] = process_temp[group];
-			s_state.effective_setpoint_c[group] = effective_sp;
+			s_state.effective_setpoint_c[group] = effective_sp[group];
 			s_state.pwm_on_ms[group] = pwm_on_ms[group];
 		}
 		xSemaphoreGive(s_state_lock);
 
-		// 4) 将控制输出写入 PWM 驱动。
+		// 5) 将控制输出写入 PWM 驱动。
 		for (uint32_t group = 0; group < APP_CONTROL_GROUPS; ++group) {
 			const uint8_t pwm_channel = s_group_map[group].pwm_channel;
 			if (process_valid[group]) {

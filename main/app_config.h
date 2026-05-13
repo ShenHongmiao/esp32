@@ -11,16 +11,18 @@
  */
 
 // ======================== Feature Switches ========================
+// 加热模式切换开关：1=当前 PID 加热；2=循环 PID 加热（档位 1/2 之间切换）。
+#define FEATURE_HEATING_MODE              2
 // 功能总开关：采集与上传使用同一组使能，避免“采了但没发”或“发了无数据”。
 #define FEATURE_NTC_CH0_ENABLE            1 // NTC 通道 0 使能，ADC_CH1，下侧分压测温
 #define FEATURE_NTC_CH1_ENABLE            0 // NTC 通道 1 使能, ADC_CH2
 #define FEATURE_NTC_CH2_ENABLE            0 // NTC 通道 2 使能, ADC_CH3
 #define FEATURE_NTC_CH3_ENABLE            0 // NTC 通道 3 使能
 #define FEATURE_WF5803F_ENABLE            0 // WF5803F 功能使能
-#define FEATURE_PRESSURE_ENABLE           0 // 气压检测总开关：1=启用；0=关闭
+#define FEATURE_PRESSURE_ENABLE           1// 气压检测总开关：1=启用；0=关闭
 // 气压来源选择：0=外部 DC 电压型，1=WF5803F
 #define FEATURE_PRESSURE_SOURCE           0
-#define FEATURE_PRESSURE_DC_CH1           0 // DC 通道 1 选择
+#define FEATURE_PRESSURE_DC_CH1           1 // DC 通道 1 选择
 #define FEATURE_PRESSURE_DC_CH2           0 // DC 通道 2 选择
 #define FEATURE_VOLTAGE_MONITOR_ENABLE    1 // 监测电压并上报，必要时触发保护
 #define FEATURE_PID_OUT_ENABLE            1 // 发送 PID 输出值
@@ -30,8 +32,8 @@
 // 心跳失联保护开关：1=启用超时降级到安全温度；0=忽略心跳超时。
 #define FEATURE_HEARTBEAT_FAILSAFE_ENABLE 0
 //PWM通道使能
-#define APP_PWM_CH0_ENABLE               0 // PWM CH0 开关：1=使能输出，0=禁用，对应NTC通道
-#define APP_PWM_CH1_ENABLE               1 // PWM CH1 开关：1=使能输出，0=禁用
+#define APP_PWM_CH0_ENABLE               0 // PWM CH0 开关：1=使能输出，0=禁用，对应NTC通道3,4
+#define APP_PWM_CH1_ENABLE               1 // PWM CH1 开关：1=使能输出，0=禁用,对应NTC通道1,2
 // ======================== Control Loop ============================
 // 控制任务周期（毫秒）：越小响应越快，但 CPU 占用和噪声敏感度越高。也是其他任务（如采样、通信）的时间基准。
 #define APP_CONTROL_PERIOD_MS             20
@@ -48,6 +50,8 @@
 
 // PID 默认参数（上电初始值，可被运行时命令覆盖）。
 #define APP_DEFAULT_SETPOINT_C            50.0f // 初始目标温度（℃）
+// 循环 PID 模式：温度档位 2 设定值（档位 1 仍用 APP_DEFAULT_SETPOINT_C）。
+#define APP_CYCLIC_SETPOINT2_C            60.0f
 #define APP_PID_KP_DEFAULT                0.0f  // 固定默认值：上电阶段 Kp 必须为 0（勿改）
 #define APP_PID_KI_DEFAULT                0.0f  // 固定默认值：上电阶段 Ki 必须为 0（勿改）
 #define APP_PID_KD_DEFAULT                0.0f  // 固定默认值：上电阶段 Kd 必须为 0（勿改）
@@ -55,14 +59,18 @@
 #define APP_PID_OUTPUT_MIN_MS             0.0f    // PID 输出下限：0ms 导通
 #define APP_PID_OUTPUT_MAX_MS             1000.0f // PID 输出上限：1000ms 导通（1s 全导通）
 // 控制任务启动后加载的运行 PID 参数（可根据现场调参修改）比例增益230等幅振荡点，周期9s。
-#define APP_PID_TASK_START_KP             85.5f
-#define APP_PID_TASK_START_KI             21.25f
+#define APP_PID_TASK_START_KP             83.5f
+#define APP_PID_TASK_START_KI             13.8f
 #define APP_PID_TASK_START_KD             0.0f
 
 #define APP_PID_ILIMIT_DEFAULT            50.0f // 积分限幅（%），防止积分风暴
 #define APP_PID_DEADBAND_C                0.2f  // 死区（℃）：误差落入该范围时保持当前输出
 #define APP_PID_ENABLE_INTEGRAL_SEPARATION 1    // 1=启用积分分离；0=传统积分
-#define APP_PID_INTEGRAL_SEPARATION_THRESHOLD_C 5.0f // 仅在误差绝对值不大于该值时累积积分
+#define APP_PID_INTEGRAL_SEPARATION_THRESHOLD_C 3.0f // 仅在误差绝对值不大于该值时累积积分
+
+// 循环 PID 模式保持判定：进入目标温度±阈值并持续满足该时长后切换档位。
+#define APP_CYCLIC_HOLD_THRESHOLD_C       0.5f
+#define APP_CYCLIC_HOLD_TIME_MS           1000
 
 // ======================== I2C and Peripheral Pins ================
 // I2C 总线定义：对应硬件图纸 IO11/IO12，速率 400kHz。
@@ -80,7 +88,7 @@
 // ======================== External ADC ============================
 // 外部 ADC 地址与各通道命令字（来自需求文档定义）。
 #define APP_EXT_ADC_ADDR                  0x48
-#define APP_EXT_ADC_CMD_VDETECT           0x84 
+#define APP_EXT_ADC_CMD_VDETECT           0xE4 
 #define APP_EXT_ADC_CMD_NTC0              0xC4
 #define APP_EXT_ADC_CMD_NTC1              0x94
 #define APP_EXT_ADC_CMD_NTC2              0xD4
