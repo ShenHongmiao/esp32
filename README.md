@@ -1,6 +1,6 @@
 # ESP32-S3 加热控制系统
 
-本项目基于 ESP32-S3 实现多路 NTC 温度采样 + 双路 PID 控制 + 双路 PWM 加热输出 + UDP/串口双通道通讯 + OTA 固件更新，并支持压力传感器（WF5803F 温压一体传感器 或 外部 DC 电压型压力传感器）。整体设计将采样、控制、通讯、OTA 解耦成多个 FreeRTOS 任务，关键参数集中在 `main/app_config.h` 统一管理，双路 PID 独立计算、独立输出，支持循环 PID 加热模式（温度档位自动切换）。
+本项目基于 ESP32-S3 实现多路 NTC 温度采样 + 双路 PID 控制 + 双路 PWM 加热输出 + UDP/串口双通道通讯 + OTA 固件更新，并支持压力传感器（WF5803F 温压一体传感器 或 外部 DC 电压型压力传感器）。整体设计将采样、控制、通讯、OTA 解耦成多个 FreeRTOS 任务，关键参数集中在 `main/app_config.h` 统一管理，双路 PID 独立计算、独立输出。支持三种加热模式：标准 PID 加热（模式 1）、循环 PID 加热（模式 2，温度档位自动切换）、双通道互锁交替循环（模式 3，专为相变驱动器设计，无保持时间）。
 
 ---
 
@@ -81,7 +81,7 @@
 | --- | --- |
 | `app_config.h` | 工程统一配置文件：包含所有功能开关、加热模式、时序参数、PID 参数、I2C/ADC/PWM 引脚定义、NTC 参数、WiFi/UDP 参数、OTA URL 等。业务代码只依赖此处宏定义，便于调参与硬件迁移。 |
 | `pressure_config.h` | 压力传感器派生配置：根据 `FEATURE_PRESSURE_ENABLE`、`FEATURE_PRESSURE_SOURCE`、`FEATURE_PRESSURE_DC_CHx` 的组合推导出 `APP_PRESSURE_SOURCE_WF`、`APP_PRESSURE_SOURCE_DC`、`APP_PRESSURE_DC_ADC_CMD` 等宏，并在编译期校验配置合法性（如 WF 来源需要启用 WF5803F、DC 来源需恰好选一个通道）。 |
-| `main.c` | 系统入口与任务编排：初始化 NVS → 创建互斥锁 → 初始化运行态 → 初始化 PID/FailSafe → 初始化外设(I2C/PWM) → 启动 WiFi/UDP → 创建 6 个 FreeRTOS 任务并固定到双核。详见第 3 节。 |
+| `main.c` | 系统入口与任务编排：初始化 NVS → 创建互斥锁 → 初始化运行态 → 初始化 PID/FailSafe → 初始化外设(I2C/PWM) → 启动 WiFi/UDP → 创建 6 个 FreeRTOS 任务并固定到双核。内含三种加热模式的控制逻辑（标准 PID / 循环 PID / 互锁交替循环）。详见第 3 节。 |
 | `main/CMakeLists.txt` | 组件注册：列出全部 15 个源文件，依赖 `driver`、`esp_event`、`esp_netif`、`esp_wifi`、`esp_timer`、`nvs_flash`、`app_update`、`esp_https_ota`。 |
 
 ---
@@ -131,7 +131,7 @@ init_nvs() → sys_ota_mark_app_valid() → 创建互斥锁
 
 三个核心循环并行运行：
 - `sampling_task`（2ms）：ADC 采样 → 滑动窗口更新 → 锁保护写入共享状态
-- `control_task`（20ms）：锁保护读取快照 → 选择温度源 → 计算循环设定值 → PID 更新 → 锁保护写回状态 → PWM 输出
+- `control_task`（20ms）：锁保护读取快照 → 选择温度源 → 根据加热模式计算每路设定值（模式 1 使用固定值 / 模式 2 循环切换 / 模式 3 互锁交替）→ PID 更新 → 锁保护写回状态 → PWM 输出
 - `telemetry_task`（100ms）：锁保护读取快照 → 按功能开关组帧 → USB 日志 + UDP 上报
 
 ### 3.3 数据快照与互斥锁机制
@@ -194,7 +194,7 @@ NTC 电压以 2ms 周期高速采样，而非 NTC 外设（电源电压检测、
 
 | 宏定义 | 默认值 | 说明 |
 | --- | --- | --- |
-| `FEATURE_HEATING_MODE` | 2 | 加热模式：1=标准 PID 加热；2=循环 PID 加热（档位 1/2 自动切换） |
+| `FEATURE_HEATING_MODE` | 2 | 加热模式：1=标准 PID 加热；2=循环 PID 加热（档位 1/2 自动切换）；3=双通道互锁交替循环（相变驱动器，无保持时间） |
 | `FEATURE_NTC_CH0_ENABLE` | 1 | NTC 通道 0 使能（ADC CH1，对应控制组 0 主通道） |
 | `FEATURE_NTC_CH1_ENABLE` | 0 | NTC 通道 1 使能（ADC CH2，对应控制组 0 备通道） |
 | `FEATURE_NTC_CH2_ENABLE` | 0 | NTC 通道 2 使能（ADC CH3，对应控制组 1 主通道） |
@@ -255,18 +255,112 @@ NTC 电压以 2ms 周期高速采样，而非 NTC 外设（电源电压检测、
 - **Ki 变更清积分**：当 Ki 参数被运行时修改时，积分项自动清零，避免历史积分值与新 Ki 参数不匹配。
 - **输出限幅**：PID 输出被钳位在 0~1000ms 之间，映射到 1s PWM 周期的导通时长。
 
-### 4.4 循环 PID 加热模式参数
+### 4.4 加热模式参数
+
+三种加热模式通过 `FEATURE_HEATING_MODE` 宏在编译期互斥选择（彼此完全独立，无嵌套）。
 
 | 宏定义 | 默认值 | 说明 |
 | --- | --- | --- |
-| `APP_DEFAULT_SETPOINT_C` | 50.0 | 初始目标温度 / 循环模式档位 1 温度（℃） |
-| `APP_CYCLIC_SETPOINT2_C` | 60.0 | 循环模式档位 2 温度（℃） |
-| `APP_CYCLIC_HOLD_THRESHOLD_C` | 0.5 | 档位保持判定阈值（℃）：过程温度进入目标温度 ± 该阈值后开始计时 |
-| `APP_CYCLIC_HOLD_TIME_MS` | 1000 | 保持时间（ms）：稳定在目标范围内持续该时间后切换档位 |
+| `APP_DEFAULT_SETPOINT_C` | 50.0 | 初始目标温度 / 模式 2 档位 1 温度 / 模式 3 低温点 T_low（℃） |
+| `APP_CYCLIC_SETPOINT2_C` | 60.0 | 模式 2 档位 2 温度 / 模式 3 高温点 T_high（℃） |
+| `APP_CYCLIC_HOLD_THRESHOLD_C` | 0.5 | 到达判定阈值（℃）：过程温度进入目标温度 ± 该阈值视为"已到达" |
+| `APP_CYCLIC_HOLD_TIME_MS` | 1000 | 保持时间（ms）：仅模式 2 使用，稳定在目标范围内持续该时间后切换档位 |
+| `APP_MODE3_TRIG_TEMP_C` | 35.0 | 模式 3 专有：降温触发阈值（℃），冷却通道温度降至该值以下即刻触发另一路加热 |
 
-**循环 PID 工作原理**：当 `FEATURE_HEATING_MODE = 2` 时启用。系统在档位 1（默认 50℃）和档位 2（默认 60℃）之间自动切换。每路控制组独立判定：当过程温度进入目标温度 ± 保持阈值范围内，开始计时；持续满足该条件达到保持时间后，自动切换到另一档位。档位切换时 PID 控制器自动复位（清积分和历史误差），避免档位跳变导致的控制冲击。
+#### 4.4.1 模式 2：循环 PID 加热
 
-示例时序：初始 50℃ → 加热到 49.5~50.5℃ 并保持 1s → 切换到 60℃ → 加热到 59.5~60.5℃ 并保持 1s → 切换回 50℃ → 循环往复。
+当 `FEATURE_HEATING_MODE = 2` 时启用。每路控制组独立在档位 1（`APP_DEFAULT_SETPOINT_C`，默认 50℃）和档位 2（`APP_CYCLIC_SETPOINT2_C`，默认 60℃）之间自动切换。当过程温度进入目标温度 ± `APP_CYCLIC_HOLD_THRESHOLD_C` 范围内，开始计时；持续满足该条件达到 `APP_CYCLIC_HOLD_TIME_MS` 后，自动切换到另一档位。档位切换时 PID 控制器自动复位（清积分和历史误差），避免档位跳变导致的控制冲击。
+
+核心函数：[`update_cyclic_setpoint_group()`](main/main.c#L177)，状态变量 `s_cyclic_stage[2]`、`s_cyclic_hold_start_ms[2]`。
+
+示例时序（单路）：初始 50℃ → 加热到 49.5~50.5℃ 并保持 1s → 切换到 60℃ → 加热到 59.5~60.5℃ 并保持 1s → 切换回 50℃ → 循环往复。
+
+#### 4.4.2 模式 3：双通道互锁交替循环
+
+当 `FEATURE_HEATING_MODE = 3` 时启用。专为相变驱动器设计，**无需高温保持时间，达到高温即刻进入冷却**。两路控制通道互锁：同一时刻仅一路加热（目标 T_high），另一路冷却/待命（目标 T_low），交替循环。
+
+**固有参数借用：**
+
+| 角色 | 宏来源 | 默认值 |
+| --- | --- | --- |
+| 低温点 T_low | `APP_DEFAULT_SETPOINT_C`（即运行时 `requested_sp`，可通过 `SETPOINT=` 命令动态修改） | 50℃ |
+| 高温点 T_high | `APP_CYCLIC_SETPOINT2_C`（编译期固定） | 60℃ |
+| 到达高温判定 | `APP_CYCLIC_HOLD_THRESHOLD_C`：过程温度与 T_high 偏差 | ≤ 0.5℃ 视为已到达 |
+| 降温触发判定 | `APP_MODE3_TRIG_TEMP_C`：冷却通道温度 ≤ 35℃ 时触发 | 35℃ |
+
+> `APP_CYCLIC_HOLD_TIME_MS` **不被模式 3 使用**——模式 3 的核心理念是"达到即刻跳转，不等待"。
+
+**四态状态机：**
+
+核心函数：[`update_mode3_setpoints()`](main/main.c#L440)，状态变量 `s_mode3_state : mode3_state_t`，初始状态 `MODE3_CH0_HEAT`。
+
+```
+                        ┌──────────────────────────┐
+                        │     MODE3_CH0_HEAT        │
+                        │ CH0 → T_high (加热)       │
+                        │ CH1 → T_low  (冷却)       │
+                        │ 条件: CH0 到达高温 →       │
+                        └────────────┬─────────────┘
+                                     │ 到达高温即刻跳转
+                                     ▼
+                        ┌──────────────────────────┐
+                        │     MODE3_CH0_COOL        │
+                        │ CH0 → T_low  (冷却)       │
+                        │ CH1 → T_low  (冷却)       │
+                        │ 条件: CH0 冷却到 ≤ 35℃ →  │
+                        └────────────┬─────────────┘
+                                     │
+                                     ▼
+                        ┌──────────────────────────┐
+                        │     MODE3_CH1_HEAT        │
+                        │ CH0 → T_low  (冷却)       │
+                        │ CH1 → T_high (加热)       │
+                        │ 条件: CH1 到达高温 →       │
+                        └────────────┬─────────────┘
+                                     │ 到达高温即刻跳转
+                                     ▼
+                        ┌──────────────────────────┐
+                        │     MODE3_CH1_COOL        │
+                        │ CH0 → T_low  (冷却)       │
+                        │ CH1 → T_low  (冷却)       │
+                        │ 条件: CH1 冷却到 ≤ 35℃ →  │
+                        └────────────┬─────────────┘
+                                     │
+                                     ▼
+                         回到 MODE3_CH0_HEAT（闭环）
+```
+
+**每个状态的输出与跳转条件：**
+
+| 状态 | CH0 设定值 | CH1 设定值 | 跳转条件 | 跳转目标 |
+| --- | --- | --- | --- | --- |
+| `MODE3_CH0_HEAT` | T_high (60℃) | T_low (50℃) | `\|CH0 - T_high\| ≤ 0.5℃` | `MODE3_CH0_COOL` |
+| `MODE3_CH0_COOL` | T_low (50℃) | T_low (50℃) | `CH0 ≤ 35℃` | `MODE3_CH1_HEAT` |
+| `MODE3_CH1_HEAT` | T_low (50℃) | T_high (60℃) | `\|CH1 - T_high\| ≤ 0.5℃` | `MODE3_CH1_COOL` |
+| `MODE3_CH1_COOL` | T_low (50℃) | T_low (50℃) | `CH1 ≤ 35℃` | `MODE3_CH0_HEAT` |
+
+**完整时序示例（假定两端加热/冷却速率对称）：**
+
+```
+t=0s:  状态=MODE3_CH0_HEAT  CH0→60℃(加热中)  CH1→50℃(待命)
+t=3s:  CH0 到达 59.5℃ → 进入 MODE3_CH0_COOL
+        CH0→50℃(冷却中)  CH1→50℃(待命)
+t=8s:  CH0 降至 35.0℃ → 进入 MODE3_CH1_HEAT
+        CH0→50℃(待命)  CH1→60℃(加热中)
+t=11s: CH1 到达 59.5℃ → 进入 MODE3_CH1_COOL
+        CH0→50℃(待命)  CH1→50℃(冷却中)
+t=16s: CH1 降至 35.0℃ → 回到 MODE3_CH0_HEAT
+        循环往复...
+```
+
+**关键特性：**
+
+- **互锁保护**：任意时刻只有一路设定为高温，另一路为低温或冷却，从逻辑上保证不会两路同时全功率加热。
+- **无保持时间**：到达高温后**不等待**，立即跳转。这一点与模式 2 根本不同。
+- **PID 目标值突变**：模式 3 每次状态切换时两路设定值会突变（如 T_high→T_low），PID 复位逻辑（`s_last_target_sp` 变化自动 `ctrl_pid_reset`）对模式 3 同样生效，避免积分冲击。
+- **传感器失效保护**：若某通道温度无效（`valid=false`），该通道对应的跳转条件不会触发，状态机停在当前状态，该通道 PWM 被关断（由 `control_task` 通用逻辑保证）。
+- **编译期互斥**：通过 `#if FEATURE_HEATING_MODE == 2` / `#elif FEATURE_HEATING_MODE == 3` 实现，模式 2 和模式 3 的代码完全不重叠，只共用宏定义。
+- **上电初始状态**：`s_mode3_state = MODE3_CH0_HEAT`，即 CH0 先加热，CH1 等待。
 
 ### 4.5 引脚与总线定义
 
@@ -719,7 +813,7 @@ PWM0=<ms> PWM1=<ms> SP0=<℃> SP1=<℃> SAFE=<0/1>
 - `Psrc`：压力数据来源 — `WF`（WF5803F）、`DC`（DC 电压型）、`OFF`（压力功能关闭）
 - `supply_V`：电源输入电压（V）
 - `PWM0/PWM1`：两路 PWM 导通时间（ms）
-- `SP0/SP1`：两路 PID 当前有效设定值（℃），循环模式下会随档位变化
+- `SP0/SP1`：两路 PID 当前有效设定值（℃）。模式 1 固定等于 `requested_sp`；模式 2 在 T_low/T_high 之间循环切换；模式 3 根据互锁状态在 T_low/T_high 之间交替
 - `SAFE`：是否处于心跳失联安全模式（0=正常，1=安全模式）
 
 ### 15.2 UDP 上报帧
