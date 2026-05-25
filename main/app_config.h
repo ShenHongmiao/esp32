@@ -11,7 +11,7 @@
  */
 
 // ======================== Feature Switches ========================
-// 加热模式切换开关：1=当前 PID 加热；2=循环 PID 加热（档位 1/2 之间切换）。
+// 加热模式切换开关：1=当前 PID 加热；2=循环 PID 加热（档位 1/2 之间切换）；3=双通道互锁交替循环（相变驱动器，无保持时间，达到高温即刻冷却）。
 #define FEATURE_HEATING_MODE              2
 // 功能总开关：采集与上传使用同一组使能，避免“采了但没发”或“发了无数据”。
 #define FEATURE_NTC_CH0_ENABLE            1 // NTC 通道 0 使能，ADC_CH1，下侧分压测温
@@ -71,6 +71,8 @@
 // 循环 PID 模式保持判定：进入目标温度±阈值并持续满足该时长后切换档位。
 #define APP_CYCLIC_HOLD_THRESHOLD_C       0.5f
 #define APP_CYCLIC_HOLD_TIME_MS           1000
+// 模式 3 双通道互锁循环：冷却通道温度降至该阈值以下即刻触发另一路加热。
+#define APP_MODE3_TRIG_TEMP_C             35.0f
 
 // ======================== I2C and Peripheral Pins ================
 // I2C 总线定义：对应硬件图纸 IO11/IO12，速率 400kHz。

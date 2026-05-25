@@ -107,6 +107,15 @@ static uint8_t s_cyclic_stage[APP_CONTROL_GROUPS] = {1, 1};
 static uint32_t s_cyclic_hold_start_ms[APP_CONTROL_GROUPS];
 static float s_last_target_sp[APP_CONTROL_GROUPS] = {APP_DEFAULT_SETPOINT_C, APP_DEFAULT_SETPOINT_C};
 
+// 模式 3 状态机定义：双通道互锁交替。
+typedef enum {
+    MODE3_CH0_HEAT,   // CH0 加热（目标高温），CH1 冷却（目标低温）
+    MODE3_CH0_COOL,   // CH0 已到高温，等待 CH0 降温到触发点
+    MODE3_CH1_HEAT,   // CH1 加热（目标高温），CH0 冷却（目标低温）
+    MODE3_CH1_COOL,   // CH1 已到高温，等待 CH1 降温到触发点
+} mode3_state_t;
+static mode3_state_t s_mode3_state = MODE3_CH0_HEAT;
+
 static uint32_t app_now_ms(void) {
 	// 统一使用 esp_timer 提供的微秒计时，再转换为毫秒。
 	return (uint32_t)(esp_timer_get_time() / 1000ULL);
@@ -428,6 +437,53 @@ static void apply_command(const comm_command_t *cmd) {
 			 kd1);
 }
 
+static void update_mode3_setpoints(float proc_temp_ch0, bool valid_ch0,
+                                    float proc_temp_ch1, bool valid_ch1,
+                                    float requested_sp,
+                                    float *out_sp_ch0, float *out_sp_ch1) {
+    if (out_sp_ch0 == NULL || out_sp_ch1 == NULL) {
+        return;
+    }
+
+    switch (s_mode3_state) {
+        case MODE3_CH0_HEAT:
+            *out_sp_ch0 = APP_CYCLIC_SETPOINT2_C;
+            *out_sp_ch1 = requested_sp;
+            if (valid_ch0 && fabsf(proc_temp_ch0 - APP_CYCLIC_SETPOINT2_C) <= APP_CYCLIC_HOLD_THRESHOLD_C) {
+                s_mode3_state = MODE3_CH0_COOL;
+            }
+            break;
+
+        case MODE3_CH0_COOL:
+            *out_sp_ch0 = requested_sp;
+            *out_sp_ch1 = requested_sp;
+            if (valid_ch0 && proc_temp_ch0 <= APP_MODE3_TRIG_TEMP_C) {
+                s_mode3_state = MODE3_CH1_HEAT;
+            }
+            break;
+
+        case MODE3_CH1_HEAT:
+            *out_sp_ch0 = requested_sp;
+            *out_sp_ch1 = APP_CYCLIC_SETPOINT2_C;
+            if (valid_ch1 && fabsf(proc_temp_ch1 - APP_CYCLIC_SETPOINT2_C) <= APP_CYCLIC_HOLD_THRESHOLD_C) {
+                s_mode3_state = MODE3_CH1_COOL;
+            }
+            break;
+
+        case MODE3_CH1_COOL:
+            *out_sp_ch0 = requested_sp;
+            *out_sp_ch1 = requested_sp;
+            if (valid_ch1 && proc_temp_ch1 <= APP_MODE3_TRIG_TEMP_C) {
+                s_mode3_state = MODE3_CH0_HEAT;
+            }
+            break;
+
+        default:
+            s_mode3_state = MODE3_CH0_HEAT;
+            break;
+    }
+}
+
 static void control_task(void *arg) {
 	(void)arg;
 	// 离散 PID 的采样周期（秒）。
@@ -511,6 +567,12 @@ static void control_task(void *arg) {
 				process_temp[group],
 				process_valid[group]);
 		}
+#elif FEATURE_HEATING_MODE == 3
+		update_mode3_setpoints(
+			process_temp[0], process_valid[0],
+			process_temp[1], process_valid[1],
+			requested_sp,
+			&target_sp[0], &target_sp[1]);
 #endif
 		for (uint32_t group = 0; group < APP_CONTROL_GROUPS; ++group) {
 			if (target_sp[group] != s_last_target_sp[group]) {
