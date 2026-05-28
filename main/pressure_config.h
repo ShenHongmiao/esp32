@@ -18,8 +18,8 @@
         #error "WF pressure requires FEATURE_WF5803F_ENABLE=1"
     #endif
     #if APP_PRESSURE_SOURCE_DC
-        #if (FEATURE_PRESSURE_DC_CH1 + FEATURE_PRESSURE_DC_CH2) != 1
-            #error "Select exactly one DC pressure channel: CH1 or CH2"
+        #if (FEATURE_PRESSURE_DC_CH1 == 0) && (FEATURE_PRESSURE_DC_CH2 == 0)
+            #error "Select at least one DC pressure channel: CH1 or CH2"
         #endif
     #endif
 #else

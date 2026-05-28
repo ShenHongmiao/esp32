@@ -46,10 +46,10 @@ typedef struct {
 	float wf_pressure_kpa;
 	bool wf_valid;
 
-	// DC pressure sensor sample (voltage output).
-	float dc_pressure_kpa;
-	float dc_pressure_voltage_v;
-	bool dc_pressure_valid;
+	// DC pressure sensor sample (voltage output, dual channel).
+	float dc_pressure_kpa_ch1;
+	float dc_pressure_kpa_ch2;
+	uint8_t pressure_mask; // bit 0 for CH1, bit 1 for CH2
 
     // 电源电压与欠压状态。
 	float supply_voltage_v;
@@ -141,9 +141,9 @@ static void runtime_init(void) {
 		s_last_target_sp[group] = APP_DEFAULT_SETPOINT_C;
 	}
 	s_state.last_heartbeat_ms = app_now_ms();
-	s_state.dc_pressure_kpa = 0.0f;
-	s_state.dc_pressure_voltage_v = 0.0f;
-	s_state.dc_pressure_valid = false;
+	s_state.dc_pressure_kpa_ch1 = 0.0f;
+	s_state.dc_pressure_kpa_ch2 = 0.0f;
+	s_state.pressure_mask = 0;
 }
 
 static float select_process_temperature_group(const app_runtime_t *sample, uint8_t primary, uint8_t secondary) {
@@ -239,9 +239,6 @@ static void ntc_filter_push_voltage_locked(ntc_filter_state_t *filter, uint8_t c
 
 static void sample_non_ntc_peripherals(app_runtime_t *sample) {
 	sample->wf_valid = false;
-	sample->dc_pressure_valid = false;
-	sample->dc_pressure_kpa = 0.0f;
-	sample->dc_pressure_voltage_v = 0.0f;
 
 #if FEATURE_VOLTAGE_MONITOR_ENABLE
 	// 电源检测每个控制周期采样一次。
@@ -254,12 +251,41 @@ static void sample_non_ntc_peripherals(app_runtime_t *sample) {
 
 #if APP_PRESSURE_SOURCE_DC
 	// 读取 DC 电压型压力传感器。
-	periph_pressure_dc_sample_t pressure_sample = {0};
-	if (periph_pressure_dc_read(&pressure_sample) == ESP_OK) {
-		sample->dc_pressure_kpa = pressure_sample.pressure_kpa;
-		sample->dc_pressure_voltage_v = pressure_sample.voltage_v;
-		sample->dc_pressure_valid = true;
+	float local_kpa_ch1 = 0.0f;
+	float local_kpa_ch2 = 0.0f;
+	uint8_t local_mask = 0;
+
+#if FEATURE_PRESSURE_DC_CH1
+	uint16_t raw1 = 0;
+	if (periph_adc_read_raw12(APP_EXT_ADC_CMD_Press1, &raw1) == ESP_OK) {
+		float v1 = periph_adc_raw12_to_voltage(raw1, APP_ADC_VREF_V) * APP_PRESSURE_DC_VOUT_SCALE;
+		float p1 = periph_pressure_dc_voltage_to_kpa(v1);
+		if (p1 < 0.0f) {
+			p1 = 0.0f;
+		}
+		local_kpa_ch1 = p1;
+		local_mask |= 0x01;
 	}
+#endif
+
+#if FEATURE_PRESSURE_DC_CH2
+	uint16_t raw2 = 0;
+	if (periph_adc_read_raw12(APP_EXT_ADC_CMD_Press2, &raw2) == ESP_OK) {
+		float v2 = periph_adc_raw12_to_voltage(raw2, APP_ADC_VREF_V) * APP_PRESSURE_DC_VOUT_SCALE;
+		float p2 = periph_pressure_dc_voltage_to_kpa(v2);
+		if (p2 < 0.0f) {
+			p2 = 0.0f;
+		}
+		local_kpa_ch2 = p2;
+		local_mask |= 0x02;
+	}
+#endif
+
+	xSemaphoreTake(s_state_lock, portMAX_DELAY);
+	s_state.dc_pressure_kpa_ch1 = local_kpa_ch1;
+	s_state.dc_pressure_kpa_ch2 = local_kpa_ch2;
+	s_state.pressure_mask = local_mask;
+	xSemaphoreGive(s_state_lock);
 #endif
 
 #if FEATURE_WF5803F_ENABLE
@@ -338,9 +364,6 @@ static void sampling_task(void *arg) {
 			sensor_snapshot.wf_temp_c = slow_sample.wf_temp_c;
 			sensor_snapshot.wf_pressure_kpa = slow_sample.wf_pressure_kpa;
 			sensor_snapshot.wf_valid = slow_sample.wf_valid;
-			sensor_snapshot.dc_pressure_kpa = slow_sample.dc_pressure_kpa;
-			sensor_snapshot.dc_pressure_voltage_v = slow_sample.dc_pressure_voltage_v;
-			sensor_snapshot.dc_pressure_valid = slow_sample.dc_pressure_valid;
 			sensor_snapshot.supply_voltage_v = slow_sample.supply_voltage_v;
 			sensor_snapshot.undervoltage = slow_sample.undervoltage;
 			slow_sample_counter = 0;
@@ -355,9 +378,6 @@ static void sampling_task(void *arg) {
 		s_state.wf_temp_c = sensor_snapshot.wf_temp_c;
 		s_state.wf_pressure_kpa = sensor_snapshot.wf_pressure_kpa;
 		s_state.wf_valid = sensor_snapshot.wf_valid;
-		s_state.dc_pressure_kpa = sensor_snapshot.dc_pressure_kpa;
-		s_state.dc_pressure_voltage_v = sensor_snapshot.dc_pressure_voltage_v;
-		s_state.dc_pressure_valid = sensor_snapshot.dc_pressure_valid;
 		s_state.supply_voltage_v = sensor_snapshot.supply_voltage_v;
 		s_state.undervoltage = sensor_snapshot.undervoltage;
 		xSemaphoreGive(s_state_lock);
@@ -664,22 +684,28 @@ static void telemetry_task(void *arg) {
 		snapshot = s_state;
 		xSemaphoreGive(s_state_lock);
 
-		float pressure_kpa = 0.0f;
-		bool pressure_valid = false;
+		float pressure_kpa_1 = NAN;
+		float pressure_kpa_2 = NAN;
 		const char *pressure_src = "OFF";
+
 #if APP_PRESSURE_SOURCE_WF
-		pressure_kpa = snapshot.wf_pressure_kpa;
-		pressure_valid = snapshot.wf_valid;
+		if (snapshot.wf_valid) {
+			pressure_kpa_1 = snapshot.wf_pressure_kpa;
+		}
 		pressure_src = "WF";
 #elif APP_PRESSURE_SOURCE_DC
-		pressure_kpa = snapshot.dc_pressure_kpa;
-		pressure_valid = snapshot.dc_pressure_valid;
+		if ((snapshot.pressure_mask & 0x01) != 0) {
+			pressure_kpa_1 = snapshot.dc_pressure_kpa_ch1;
+		}
+		if ((snapshot.pressure_mask & 0x02) != 0) {
+			pressure_kpa_2 = snapshot.dc_pressure_kpa_ch2;
+		}
 		pressure_src = "DC";
 #endif
 
 		// USB 日志实时输出。
 		ESP_LOGI(TAG,
-				 "T0=%.2f V0=%.3f T1=%.2f V1=%.3f T2=%.2f V2=%.3f T3=%.2f V3=%.3f WF_T=%.2f P=%.2f Psrc=%s V=%.2f PWM0=%.1f PWM1=%.1f SP0=%.2f SP1=%.2f SAFE=%d",
+				 "T0=%.2f V0=%.3f T1=%.2f V1=%.3f T2=%.2f V2=%.3f T3=%.2f V3=%.3f WF_T=%.2f P1=%.2f P2=%.2f Psrc=%s V=%.2f PWM0=%.1f PWM1=%.1f SP0=%.2f SP1=%.2f SAFE=%d",
 				 snapshot.ntc_temp_c[0],
 				 snapshot.ntc_voltage_v[0],
 				 snapshot.ntc_temp_c[1],
@@ -689,7 +715,8 @@ static void telemetry_task(void *arg) {
 				 snapshot.ntc_temp_c[3],
 				 snapshot.ntc_voltage_v[3],
 				 snapshot.wf_temp_c,
-				 pressure_valid ? pressure_kpa : NAN,
+				 pressure_kpa_1,
+				 pressure_kpa_2,
 				 pressure_src,
 				 snapshot.supply_voltage_v,
 				 snapshot.pwm_on_ms[0],
@@ -770,11 +797,16 @@ static void telemetry_task(void *arg) {
 
 #if APP_PRESSURE_SOURCE_DC
 		// DC 压力帧。
-		if (snapshot.dc_pressure_valid) {
-			uint8_t payload_p[4] = {0};
-			const size_t p_len = comm_protocol_pack_pressure_payload(
-				snapshot.dc_pressure_kpa, payload_p, sizeof(payload_p));
-			if (p_len > 0) {
+		if (snapshot.pressure_mask != 0) {
+			uint8_t payload_p[16] = {0}; // 确保缓冲区足够大
+			const size_t p_len = comm_protocol_pack_dynamic_pressure_payload(
+				payload_p, 
+				snapshot.pressure_mask, 
+				snapshot.dc_pressure_kpa_ch1, 
+				snapshot.dc_pressure_kpa_ch2
+			);
+
+			if (p_len > 1) {
 				telemetry_send(COMM_CMD_PRESSURE, payload_p, p_len);
 			}
 		}

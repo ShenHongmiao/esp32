@@ -51,8 +51,15 @@ size_t comm_protocol_pack_voltage_payload(float voltage_v, bool undervoltage, ui
 // 打包 PID 输出载荷（单位：ms），单路输出。
 size_t comm_protocol_pack_pid_out_payload(float pid_out_ms, uint8_t *out_payload, size_t out_cap);
 
-// 打包压力载荷（单位：kPa）。
-size_t comm_protocol_pack_pressure_payload(float pressure_kpa, uint8_t *out_payload, size_t out_cap);
+/**
+ * @brief 动态打包压力通道的 Payload (CMD 0x05)
+ * @param payload_buf 用于存放打包后载荷的缓冲区指针
+ * @param mask 通道掩码 (bit0: CH1使能, bit1: CH2使能)
+ * @param ch1_val CH1 的压力值 (kPa)
+ * @param ch2_val CH2 的压力值 (kPa)
+ * @return 组装后的有效载荷实际长度 (字节数)
+ */
+size_t comm_protocol_pack_dynamic_pressure_payload(uint8_t *payload_buf, uint8_t mask, float ch1_val, float ch2_val);
 
 // 打包文本信息载荷。
 size_t comm_protocol_pack_text_payload(const char *text, uint8_t *out_payload, size_t out_cap);

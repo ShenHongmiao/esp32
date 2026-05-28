@@ -146,14 +146,25 @@ size_t comm_protocol_pack_pid_out_payload(float pid_out_ms, uint8_t *out_payload
     return 4;
 }
 
-size_t comm_protocol_pack_pressure_payload(float pressure_kpa, uint8_t *out_payload, size_t out_cap) {
-    // 固定字段：int32 压力(kPa×100)，共 4 字节。
-    if (out_payload == NULL || out_cap < 4) {
+size_t comm_protocol_pack_dynamic_pressure_payload(uint8_t *payload_buf, uint8_t mask, float ch1_val, float ch2_val) {
+    if (payload_buf == NULL) {
         return 0;
     }
 
-    write_i32_le(&out_payload[0], scale100_to_i32(pressure_kpa));
-    return 4;
+    size_t offset = 0;
+    payload_buf[offset++] = mask;
+
+    if ((mask & 0x01) != 0) {
+        write_i32_le(&payload_buf[offset], scale100_to_i32(ch1_val));
+        offset += 4;
+    }
+
+    if ((mask & 0x02) != 0) {
+        write_i32_le(&payload_buf[offset], scale100_to_i32(ch2_val));
+        offset += 4;
+    }
+
+    return offset;
 }
 
 size_t comm_protocol_pack_text_payload(const char *text, uint8_t *out_payload, size_t out_cap) {

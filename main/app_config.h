@@ -23,7 +23,7 @@
 // 气压来源选择：0=外部 DC 电压型，1=WF5803F
 #define FEATURE_PRESSURE_SOURCE           0
 #define FEATURE_PRESSURE_DC_CH1           1 // DC 通道 1 选择
-#define FEATURE_PRESSURE_DC_CH2           0 // DC 通道 2 选择
+#define FEATURE_PRESSURE_DC_CH2           1 // DC 通道 2 选择
 #define FEATURE_VOLTAGE_MONITOR_ENABLE    1 // 监测电压并上报，必要时触发保护
 #define FEATURE_PID_OUT_ENABLE            1 // 发送 PID 输出值
 #define FEATURE_UPLOAD_ENABLE             1 // 0: 仅串口日志；1: 同时 UDP 上传

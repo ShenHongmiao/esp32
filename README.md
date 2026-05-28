@@ -65,9 +65,9 @@
 
 | 文件 | 功能描述 |
 | --- | --- |
-| `comm_protocol.h/.c` | 帧协议封装：帧结构 `HEAD(0xDE) + CMD + LEN + PAYLOAD + CRC8 + TAIL(0xED)`。CRC8 多项式 0x07，覆盖 HEAD 至 PAYLOAD 全部字节。浮点数据统一放大 100 倍转为小端整数传输。提供 6 种标准载荷打包函数（NTC、WF5803F、电压、PID 输出、压力、文本）。 |
-| `comm_command.h/.c` | 文本命令解析：输入行先去空白、转大写，然后匹配关键字。支持纯命令（`HB`、`OTA`）和键值对命令（`SETPOINT=xx`、`KP=xx`、`KI=xx`、`KD=xx`、`ILIMIT=xx`）。解析失败返回 `COMM_COMMAND_NONE`。串口和 UDP 共用同一解析器。 |
-| `comm_udp.h/.c` | WiFi STA + UDP 通讯管理：WiFi 初始化（STA 模式、WPA2/WPA3 认证）、自动重连（最多 10 次）、UDP socket 创建与绑定（本地端口 6001，远端 10.92.90.124:6000）。提供 `send()` 发送数据帧、`receive_line()` 接收文本命令（带超时）。使用 FreeRTOS 事件组 `WIFI_CONNECTED_BIT` 同步 WiFi 连接状态。 |
+| `comm_protocol.h/.c` | (收发通用) 帧协议封装：帧结构 `HEAD(0xDE) + CMD + LEN + PAYLOAD + CRC8 + TAIL(0xED)`。CRC8 多项式 0x07，覆盖 HEAD 至 PAYLOAD 全部字节。浮点数据统一放大 100 倍转为小端整数传输。提供标准载荷的动态与静态打包提取实现（CMD 0x01~0x05 等）。 |
+| `comm_command.h/.c` | (命令接收) 文本命令解析：解析并响应上位机下发指令以实施控制。支持纯命令（`HB`、`OTA`）和键值对命令（`SETPOINT=xx`、`KP=xx`、`KI=xx`、`KD=xx`、`ILIMIT=xx`）。解析失败返回 `COMM_COMMAND_NONE`。串口和 UDP 共用同一解析器。 |
+| `comm_udp.h/.c` | (收发通用) 网络链路层与套接字管理： WiFi 初始化（STA 模式、WPA2/WPA3 认证）、自动重连。 UDP socket 物理通讯层创建与绑定响应收发。提供 `send()` 上报遥测、`receive_line()` 接收指令数据流块。 |
 
 ### 2.4 系统服务层（sys_*）
 
@@ -142,7 +142,8 @@ init_nvs() → sys_ota_mark_app_valid() → 创建互斥锁
 app_runtime_t {
     ntc_temp_c[4], ntc_voltage_v[4], ntc_valid[4]  // NTC 四路数据
     wf_temp_c, wf_pressure_kpa, wf_valid            // WF5803F 数据
-    dc_pressure_kpa, dc_pressure_voltage_v, dc_pressure_valid  // DC 压力数据
+    dc_pressure_kpa_ch1, dc_pressure_kpa_ch2        // DC 压力双通道数据
+    pressure_mask                                   // 压力数据有效性掩码 (bit0: CH1, bit1: CH2)
     supply_voltage_v, undervoltage                   // 电源监测
     process_temp_c[2], requested_setpoint_c          // 控制输入
     effective_setpoint_c[2], pwm_on_ms[2]            // 控制输出
