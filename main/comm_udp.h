@@ -23,7 +23,7 @@ bool comm_udp_is_connected(void);
 // 发送一帧 UDP 数据到配置的远端地址。
 esp_err_t comm_udp_send(const uint8_t *data, size_t len);
 
-// 接收一行文本命令；超时返回 0，错误返回负值。
-int comm_udp_receive_line(char *out_line, size_t out_len, int timeout_ms);
+// 接收一行文本命令；按 APP_UDP_RECEIVE_TIMEOUT_MS 超时时返回 0，错误返回负值。
+int comm_udp_receive_line(char *out_line, size_t out_len);
 
 #endif  // COMM_UDP_H

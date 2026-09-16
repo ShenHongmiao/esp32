@@ -42,6 +42,6 @@ void ctrl_pid_set_integral_limit(ctrl_pid_t *pid, float integral_limit);
 void ctrl_pid_reset(ctrl_pid_t *pid);
 
 // 根据当前测量值和采样周期计算控制输出。
-float ctrl_pid_update(ctrl_pid_t *pid, float measurement, float dt_s, float *out_error);
+float ctrl_pid_update(ctrl_pid_t *pid, float measurement, float dt_s);
 
 #endif  // CTRL_PID_H

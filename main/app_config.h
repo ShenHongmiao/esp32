@@ -155,11 +155,16 @@
 // WiFi 与 UDP 参数：联调时请按现场网络修改。
 #define APP_WIFI_SSID                     "ESP32"
 #define APP_WIFI_PASSWORD                 "12345678"
+// WiFi 断线后先快速重试的次数；用尽后转为固定周期的慢速重试。
 #define APP_WIFI_MAX_RETRY                10
+// 快速重试用尽后的 WiFi 重连周期，默认每 1 分钟尝试一次。
+#define APP_WIFI_RETRY_PERIOD_MS          60000
 
 #define APP_UDP_REMOTE_IP                 "192.168.137.1"
 #define APP_UDP_REMOTE_PORT               6000
 #define APP_UDP_LOCAL_PORT                6001
+// UDP 命令接收阻塞上限；socket 创建时设置一次，避免每个报文重复调用 setsockopt。
+#define APP_UDP_RECEIVE_TIMEOUT_MS        200
 
 // ======================== OTA ====================================
 // OTA URL 为空时不会执行下载；温度门禁用于避免高温写闪存风险。

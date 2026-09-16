@@ -1,6 +1,15 @@
 # ESP32-S3 加热控制系统
 
-本项目基于 ESP32-S3 实现多路 NTC 温度采样 + 双路 PID 控制 + 双路 PWM 加热输出 + UDP/串口双通道通讯 + OTA 固件更新，并支持压力传感器（WF5803F 温压一体传感器 或 外部 DC 电压型压力传感器）。整体设计将采样、控制、通讯、OTA 解耦成多个 FreeRTOS 任务，关键参数集中在 `main/app_config.h` 统一管理，双路 PID 独立计算、独立输出。支持三种加热模式：标准 PID 加热（模式 1）、循环 PID 加热（模式 2，温度档位自动切换）、双通道互锁交替循环（模式 3，专为相变驱动器设计，无保持时间）。
+本项目基于 ESP32-S3 实现多路 NTC 温度采样、双路独立控制、双路 PWM 加热输出、UDP/串口双通道命令、UDP 遥测和 OTA 固件更新，并支持 WF5803F 温压一体传感器或最多两路外部 DC 电压型压力传感器。采样、控制、通讯和 OTA 被拆分为独立 FreeRTOS 任务，关键参数集中在 `main/app_config.h`。
+
+工程支持四种编译期互斥的加热模式：
+
+- 模式 1：标准 PID 恒温。
+- 模式 2：两个温度档位之间循环 PID 控制。
+- 模式 3：双通道互锁交替循环。
+- 模式 4：每个控制组独立执行“低温 PID 稳定 → 全功率定长脉冲 → 断电冷却”，并依据实测峰值自适应修正脉冲时长。
+
+当前默认配置为模式 4。模式 4 的学习结果只保存在 RAM 中，不写入 NVS；设备每次重新上电都会从默认 200ms 脉冲重新学习。
 
 ---
 
@@ -27,7 +36,7 @@
 
 | Name | Type | SubType | Offset | Size | 描述 |
 | --- | --- | --- | --- | --- | --- |
-| nvs | data | nvs | 0x9000 | 0x5000 (20KB) | 存储 PID 参数、WiFi 密码、校准值等非易失数据 |
+| nvs | data | nvs | 0x9000 | 0x5000 (20KB) | ESP-IDF/NVS 系统数据空间；当前业务代码不持久化 PID 参数或模式 4 学习值 |
 | otadata | data | ota | 0xE000 | 0x2000 (8KB) | OTA 引导控制位，决定启动 factory/ota_0/ota_1 |
 | phy_init | data | phy | 0x10000 | 0x1000 (4KB) | 射频物理层初始化校准数据 |
 | factory | app | factory | 0x20000 | 0x140000 (1.25MB) | 出厂固件，永不覆盖 |
@@ -49,7 +58,7 @@
 | --- | --- |
 | `periph_i2c.h/.c` | I2C 总线主机驱动：初始化（幂等调用）、先写后读（write_then_read）、单寄存器读写。内部维护 FreeRTOS 互斥锁 `s_i2c_lock` 串行化所有 I2C 事务，避免多任务并发访问导致总线冲突。所有 I2C 事务超时设为 100ms。 |
 | `periph_adc.h/.c` | 外部 12 位 ADC 抽象层：通过 I2C 发送通道选择命令后读取 2 字节 12 位原始值（高字节低 4 位为 D11~D8 + 低字节 8 位为 D7~D0），提供原始值转电压（`raw12 / 4095 × Vref`）和电源电压反算（分压比还原）函数。 |
-| `periph_pwm.h/.c` | 双通道 LEDC PWM 输出驱动：初始化定时器（20kHz / 10bit），配置 CH0(GPIO4) 和 CH1(GPIO5) 两个通道。支持以导通时间（ms）或占空比（%）设置输出，内部自动换算为 LEDC 计数值。上电默认关断。支持 `force_off` 强制关断和单通道独立关断。CH0/CH1 各有独立使能宏 `APP_PWM_CH0_ENABLE` / `APP_PWM_CH1_ENABLE`。 |
+| `periph_pwm.h/.c` | 双通道 LEDC PWM 输出驱动：初始化定时器（20kHz / 10bit），配置 CH0(GPIO4) 和 CH1(GPIO5)。上层以 0~1000ms 导通时间设置输出，驱动内部换算为占空比和 LEDC 计数值。上电默认关断，支持单路或双路强制关断；每路另有独立编译开关。 |
 | `periph_wf5803f.h/.c` | WF5803F 温压一体传感器驱动：向命令寄存器(0x30)写入 0x0A 启动单次温压联合测量，轮询状态寄存器(0x02) bit0 等待转换完成（最多 20 次 × 2ms），从 0x06 连续读取 5 字节（压力 24bit 大端 + 温度 16bit 大端），换算为 kPa 和 ℃。 |
 | `periph_pressure_dc.h/.c` | 外部 DC 电压型压力传感器驱动：读取指定 ADC 通道的 12 位原始值，经分压比例还原和线性模型 `Vout = 0.0188 × P + 0.2` 换算为 kPa。负压钳位为 0。 |
 
@@ -66,8 +75,8 @@
 | 文件 | 功能描述 |
 | --- | --- |
 | `comm_protocol.h/.c` | (收发通用) 帧协议封装：帧结构 `HEAD(0xDE) + CMD + LEN + PAYLOAD + CRC8 + TAIL(0xED)`。CRC8 多项式 0x07，覆盖 HEAD 至 PAYLOAD 全部字节。浮点数据统一放大 100 倍转为小端整数传输。提供标准载荷的动态与静态打包提取实现（CMD 0x01~0x05 等）。 |
-| `comm_command.h/.c` | (命令接收) 文本命令解析：解析并响应上位机下发指令以实施控制。支持纯命令（`HB`、`OTA`）和键值对命令（`SETPOINT=xx`、`KP=xx`、`KI=xx`、`KD=xx`、`ILIMIT=xx`）。解析失败返回 `COMM_COMMAND_NONE`。串口和 UDP 共用同一解析器。 |
-| `comm_udp.h/.c` | (收发通用) 网络链路层与套接字管理： WiFi 初始化（STA 模式、WPA2/WPA3 认证）、自动重连。 UDP socket 物理通讯层创建与绑定响应收发。提供 `send()` 上报遥测、`receive_line()` 接收指令数据流块。 |
+| `comm_command.h/.c` | 文本命令解析：支持纯命令 `HB`、`OTA`，以及 `SETPOINT/SP`、`KP`、`KI`、`KD`、`ILIMIT/INTEGRAL_LIMIT`、`HTIME` 键值命令。解析失败返回 `COMM_COMMAND_NONE`，串口和 UDP 共用同一解析器。 |
+| `comm_udp.h/.c` | WiFi STA 与 UDP 套接字管理：断线后先快速重试 10 次，仍失败则每 60 秒继续尝试，获取 IP 后恢复快速重试计数并停止慢速定时器。UDP socket 在创建时一次性设置 200ms 接收超时。 |
 
 ### 2.4 系统服务层（sys_*）
 
@@ -80,8 +89,8 @@
 | 文件 | 功能描述 |
 | --- | --- |
 | `app_config.h` | 工程统一配置文件：包含所有功能开关、加热模式、时序参数、PID 参数、I2C/ADC/PWM 引脚定义、NTC 参数、WiFi/UDP 参数、OTA URL 等。业务代码只依赖此处宏定义，便于调参与硬件迁移。 |
-| `pressure_config.h` | 压力传感器派生配置：根据 `FEATURE_PRESSURE_ENABLE`、`FEATURE_PRESSURE_SOURCE`、`FEATURE_PRESSURE_DC_CHx` 的组合推导出 `APP_PRESSURE_SOURCE_WF`、`APP_PRESSURE_SOURCE_DC`、`APP_PRESSURE_DC_ADC_CMD` 等宏，并在编译期校验配置合法性（如 WF 来源需要启用 WF5803F、DC 来源需恰好选一个通道）。 |
-| `main.c` | 系统入口与任务编排：初始化 NVS → 创建互斥锁 → 初始化运行态 → 初始化 PID/FailSafe → 初始化外设(I2C/PWM) → 启动 WiFi/UDP → 创建 6 个 FreeRTOS 任务并固定到双核。内含三种加热模式的控制逻辑（标准 PID / 循环 PID / 互锁交替循环）。详见第 3 节。 |
+| `pressure_config.h` | 压力传感器派生配置：根据 `FEATURE_PRESSURE_ENABLE`、`FEATURE_PRESSURE_SOURCE`、`FEATURE_PRESSURE_DC_CHx` 的组合推导 `APP_PRESSURE_SOURCE_WF`、`APP_PRESSURE_SOURCE_DC` 及通道使能状态，并在编译期校验配置合法性。 |
+| `main.c` | 系统入口与任务编排：初始化 NVS → 创建互斥锁 → 初始化运行态 → 初始化 PID/FailSafe → 初始化外设(I2C/PWM) → 按开关启动 WiFi/UDP → 创建 5~6 个 FreeRTOS 任务并固定到双核。内含四种加热模式的控制逻辑。详见第 3 节。 |
 | `main/CMakeLists.txt` | 组件注册：列出全部 15 个源文件，依赖 `driver`、`esp_event`、`esp_netif`、`esp_wifi`、`esp_timer`、`nvs_flash`、`app_update`、`esp_https_ota`。 |
 
 ---
@@ -90,7 +99,7 @@
 
 ### 3.1 任务划分与双核分配
 
-系统共 6 个 FreeRTOS 任务，按职责分配到 ESP32-S3 的两个核心：
+无线功能开启时系统共创建 6 个 FreeRTOS 任务；`FEATURE_WIRELESS_ENABLE=0` 时不创建 `udp_command_task`，其余 5 个任务仍运行。任务按职责分配到 ESP32-S3 的两个核心：
 
 **核心 1（core_ctrl）：控制核心，运行实时性要求最高的任务**
 
@@ -118,10 +127,10 @@
 init_nvs() → sys_ota_mark_app_valid() → 创建互斥锁
 → ntc_filter_reset() → runtime_init() → ctrl_pid_init(kp=0,ki=0,kd=0)
 → ctrl_failsafe_init() → periph_i2c_init() → periph_pwm_init()
-→ comm_udp_start() → 创建 6 个任务
+→ （无线启用时）comm_udp_start() → 创建业务任务
 ```
 
-关键设计：上电阶段 PID 参数固定为 0/0/0，确保烧录和启动阶段 PWM 输出为 0，不会误加热。
+关键设计：上电阶段 PID 参数固定为 0/0/0，确保烧录和启动阶段 PWM 输出为 0，不会误加热。模式 4 的两路基准脉冲均从 `APP_MODE4_HEAT_TIME_DEFAULT_MS` 初始化，任何上次运行的学习结果都不会跨上电保留。
 
 **阶段 2：控制任务启动加载运行参数**
 
@@ -131,7 +140,7 @@ init_nvs() → sys_ota_mark_app_valid() → 创建互斥锁
 
 三个核心循环并行运行：
 - `sampling_task`（2ms）：ADC 采样 → 滑动窗口更新 → 锁保护写入共享状态
-- `control_task`（20ms）：锁保护读取快照 → 选择温度源 → 根据加热模式计算每路设定值（模式 1 使用固定值 / 模式 2 循环切换 / 模式 3 互锁交替）→ PID 更新 → 锁保护写回状态 → PWM 输出
+- `control_task`（20ms）：读取快照 → 对每个控制组计算有效 NTC 平均值 → 执行所选模式（模式 1~3 为 PID 路径；模式 4 为 PID/全功率/关断三态路径）→ 写回控制结果 → 按映射表输出到物理 PWM 通道
 - `telemetry_task`（100ms）：锁保护读取快照 → 按功能开关组帧 → USB 日志 + UDP 上报
 
 ### 3.3 数据快照与互斥锁机制
@@ -148,10 +157,11 @@ app_runtime_t {
     process_temp_c[2], requested_setpoint_c          // 控制输入
     effective_setpoint_c[2], pwm_on_ms[2]            // 控制输出
     last_heartbeat_ms, ota_pending                   // 通讯状态
+    mode4_heat_time_base_ms, mode4_config_revision   // 模式 4 RAM 配置与复位事件版本
 }
 ```
 
-各任务在临界区内快速复制所需字段到本地快照后立即释放锁，临界区仅包含内存拷贝操作，无 I/O 或计算，保证低延迟。NTC 滑动滤波器的环形缓冲区也通过同一锁保护。
+各任务只在临界区内快速复制或提交共享字段，I2C 读取、温度换算、协议打包和网络发送均在锁外完成。NTC 滑动滤波器只由唯一的 `sampling_task` 访问，不需要跨任务加锁。
 
 ### 3.4 双路控制映射
 
@@ -162,7 +172,7 @@ app_runtime_t {
 | Group 0 | `s_pid[0]` | NTC0 (ADC CH1) | NTC1 (ADC CH2) | PWM CH1 | GPIO5 |
 | Group 1 | `s_pid[1]` | NTC2 (ADC CH3) | NTC3 (ADC CH4) | PWM CH0 | GPIO4 |
 
-温度源选择规则：主通道有效则使用主通道值，主通道无效则回退到备通道值，两路都无效则该组控制暂停（PWM 强制关断）。控制温度采用平均规则：主备双通道都有效时取平均值作为过程温度，单通道有效取单通道值。
+控制与遥测共用同一套分组平均规则：主、备 NTC 都有效时取算术平均值；只有一路有效时使用该路；两路都无效时该控制组无有效过程温度，PWM 强制关断。这里的“主/备”只描述接线映射，并不表示双路都有效时优先使用主通道。
 
 上位机命令的设定值与 PID 参数（Kp/Ki/Kd/ILimit）对两路同步下发，但两路 PID 控制器各自独立维护积分项和历史误差，控制输出分别独立计算。
 
@@ -181,11 +191,11 @@ ntc_filter_state_t {
 }
 ```
 
-`sampling_task` 每 2ms 采集一次各使能通道的 ADC 电压，通过 `ntc_filter_push_voltage_locked()` 推入环形缓冲区：新样本覆盖最旧样本，增量更新电压和，重新计算均值。窗口大小为 `APP_NTC_FILTER_WINDOW_SIZE`（默认 10），即 20ms 的滑动平均窗口。滤波器未填满窗口时，均值基于已采集的样本数计算。
+`sampling_task` 每 2ms 采集一次各使能通道的 ADC 电压，通过 `ntc_filter_push_voltage_locked()` 推入环形缓冲区：新样本覆盖最旧样本，增量更新电压和，重新计算均值。窗口大小为 `APP_NTC_FILTER_WINDOW_SIZE`（默认 10），即 20ms 的滑动平均窗口。滤波器未填满窗口时，均值基于已采集的样本数计算。函数名中的 `locked` 是历史命名；当前调用发生在共享状态锁之外，其线程安全来自只有一个采样任务访问该滤波器。
 
 ### 3.6 慢采样分频
 
-NTC 电压以 2ms 周期高速采样，而非 NTC 外设（电源电压检测、DC 压力传感器、WF5803F）以较慢的控制周期（20ms）采样。通过 `slow_sample_div` 分频器实现：`sampling_task` 内部维护计数器，每 `APP_CONTROL_PERIOD_MS / APP_NTC_SAMPLE_PERIOD_MS` 次（默认 10 次）触发一次慢采样，读取非 NTC 外设并更新到共享状态。这避免了不必要的 I2C 总线占用。
+NTC 电压以 2ms 周期高速采样，而非 NTC 外设（电源电压、DC 压力、WF5803F）按约 20ms 的慢周期采样。任务启动时先完成一次慢采样，此后通过 `APP_CONTROL_PERIOD_MS / APP_NTC_SAMPLE_PERIOD_MS` 分频（默认 10 次）更新本地 `slow_sample`。每次 2ms 循环最终把 NTC 与最近一次慢采样组成一个完整快照，再在一次加锁中提交到 `s_state`，因此控制和遥测不会读到只更新一半的压力通道组合。
 
 ---
 
@@ -204,7 +214,7 @@ NTC 电压以 2ms 周期高速采样，而非 NTC 外设（电源电压检测、
 | `FEATURE_PRESSURE_ENABLE` | 1 | 气压检测总开关：1=启用；0=关闭 |
 | `FEATURE_PRESSURE_SOURCE` | 0 | 气压来源选择：0=外部 DC 电压型；1=WF5803F |
 | `FEATURE_PRESSURE_DC_CH1` | 1 | DC 压力通道 1 选择（ADC CH7, 0xF4） |
-| `FEATURE_PRESSURE_DC_CH2` | 0 | DC 压力通道 2 选择（ADC CH0, 0x84） |
+| `FEATURE_PRESSURE_DC_CH2` | 1 | DC 压力通道 2 选择（ADC CH0, 0x84） |
 | `FEATURE_VOLTAGE_MONITOR_ENABLE` | 1 | 电源电压监测与欠压保护 |
 | `FEATURE_PID_OUT_ENABLE` | 1 | PID 输出值上报（CMD_PID_OUT 帧） |
 | `FEATURE_UPLOAD_ENABLE` | 1 | UDP 数据上报总开关（0=仅串口日志） |
@@ -265,14 +275,14 @@ NTC 电压以 2ms 周期高速采样，而非 NTC 外设（电源电压检测、
 | `APP_DEFAULT_SETPOINT_C` | 50.0 | 初始目标温度 / 模式 2 档位 1 / 模式 3、4 低温点 T_low（℃） |
 | `APP_CYCLIC_SETPOINT2_C` | 60.0 | 模式 2 档位 2 / 模式 3、4 高温点 T_high（℃） |
 | `APP_CYCLIC_HOLD_THRESHOLD_C` | 0.5 | 到达判定阈值（℃）：过程温度进入目标温度 ± 该阈值视为"已到达" |
-| `APP_CYCLIC_HOLD_TIME_MS` | 1000 | 保持时间（ms）：仅模式 2 使用，稳定在目标范围内持续该时间后切换档位 |
+| `APP_CYCLIC_HOLD_TIME_MS` | 1000 | 连续稳定保持时间（ms）：模式 2 用于切换档位，模式 4 用于允许首次全功率脉冲 |
 | `APP_MODE3_TRIG_TEMP_C` | 35.0 | 模式 3 专有：降温触发阈值（℃），冷却通道温度降至该值以下即刻触发另一路加热 |
 
 #### 4.4.1 模式 2：循环 PID 加热
 
 当 `FEATURE_HEATING_MODE = 2` 时启用。每路控制组独立在档位 1（`APP_DEFAULT_SETPOINT_C`，默认 50℃）和档位 2（`APP_CYCLIC_SETPOINT2_C`，默认 60℃）之间自动切换。当过程温度进入目标温度 ± `APP_CYCLIC_HOLD_THRESHOLD_C` 范围内，开始计时；持续满足该条件达到 `APP_CYCLIC_HOLD_TIME_MS` 后，自动切换到另一档位。档位切换时 PID 控制器自动复位（清积分和历史误差），避免档位跳变导致的控制冲击。
 
-核心函数：[`update_cyclic_setpoint_group()`](main/main.c#L177)，状态变量 `s_cyclic_stage[2]`、`s_cyclic_hold_start_ms[2]`。
+核心函数：`update_cyclic_setpoint_group()`，状态变量为每组独立的档位、保持开始时间和保持计时活动标志。单独的布尔标志用于区分“未开始计时”，不依赖毫秒时间戳是否等于 0，因此不受约 49.7 天计时回绕瞬间的零值歧义影响。
 
 示例时序（单路）：初始 50℃ → 加热到 49.5~50.5℃ 并保持 1s → 切换到 60℃ → 加热到 59.5~60.5℃ 并保持 1s → 切换回 50℃ → 循环往复。
 
@@ -293,7 +303,7 @@ NTC 电压以 2ms 周期高速采样，而非 NTC 外设（电源电压检测、
 
 **四态状态机：**
 
-核心函数：[`update_mode3_setpoints()`](main/main.c#L440)，状态变量 `s_mode3_state : mode3_state_t`，初始状态 `MODE3_CH0_HEAT`。
+核心函数：`update_mode3_setpoints()`，状态变量 `s_mode3_state : mode3_state_t`，初始状态 `MODE3_CH0_HEAT`。
 
 ```
                         ┌──────────────────────────┐
@@ -365,13 +375,38 @@ t=16s: CH1 降至 35.0℃ → 回到 MODE3_CH0_HEAT
 
 #### 4.4.3 模式 4：PID 稳定 + 全功率定长脉冲
 
-当 `FEATURE_HEATING_MODE = 4` 时启用。两个控制组各自运行 `MODE4_STABILIZE -> MODE4_HEAT -> MODE4_COOL` 三态状态机，彼此不互锁：
+当 `FEATURE_HEATING_MODE = 4` 时启用。两个控制组各自维护状态、计时、峰值、当前脉冲时长和收敛标志，彼此不互锁：
 
 - `MODE4_STABILIZE`：仅此阶段运行 PID，将温度稳定在运行期 `SP`/`SETPOINT` 指定的 T_low。进入±0.5℃并连续保持 1000ms 后清空 PID 历史项并开始脉冲。
 - `MODE4_HEAT`：持续输出 1000ms（对应 100% PWM），时长由当前 `heat_time_ms` 决定。温度不参与普通控制，只用于记录峰值和执行 T_high+3℃ 过温跳闸。
-- `MODE4_COOL`：强制输出 0ms，关断后前 500ms 继续记录热惯性峰值。温度降到 `T_low - 0.5℃` 后，根据上一轮峰值修正脉冲宽度并开始下一轮。
+- `MODE4_COOL`：强制输出 0ms，关断后前 500ms 继续记录热惯性峰值。只有峰值观察窗口已经完整结束，并且温度降到 `T_low - 0.5℃`，才根据上一轮峰值修正脉冲宽度并开始下一轮。
 
-自适应修正以 20ms 控制周期为量化步长，单次最大改变不超过当前时长的 30%，工作范围为 20~1000ms。峰值进入 T_high±1℃后标记为收敛并停止调整。T_low 不小于 T_high 时禁止脉冲，仅保留低温 PID 并输出告警。
+状态时序如下：
+
+```
+上电 / SP或HTIME命令 / 保护扰动
+                │
+                ▼
+       MODE4_STABILIZE（PID→T_low）
+                │ 连续处于 T_low±0.5℃ 达 1000ms
+                ▼
+       MODE4_HEAT（100% PWM，定长脉冲）
+                │ 脉冲结束 / 过温 / 相对超时
+                ▼
+       MODE4_COOL（0% PWM，捕获惯性峰值）
+                │ 已观察≥500ms 且温度≤T_low-0.5℃
+                └──────────────→ 自适应后直接进入下一次 MODE4_HEAT
+```
+
+自适应修正过程：
+
+1. 使用 `(脉冲结束温度 - 脉冲开始温度) / 当前脉冲时长` 估算升温斜率。
+2. 使用 `(T_high - 实测峰值) / 升温斜率` 计算建议时长变化量。
+3. 将变化量四舍五入为 20ms 控制周期的整数倍。
+4. 单次变化不超过当前工作时长的 30%，最终工作时长限制在 20~1000ms。
+5. 峰值进入 `T_high ± 1℃` 后，该控制组标记为收敛，不再继续修改脉冲时长，直到配置复位。
+
+若斜率为零、负值或包含非有限数，本轮不调整。若脉冲已达到 1000ms 但峰值仍低于目标容差带，只记录一次饱和警告，不突破上限。`T_low >= T_high` 时禁止脉冲，退化为低温 PID 控制并输出告警。
 
 | 模式 4 宏 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -385,7 +420,13 @@ t=16s: CH1 降至 35.0℃ → 回到 MODE3_CH0_HEAT
 | `APP_MODE4_LOW_HYST_C` | 0.5 | 冷却到低温点下方的触发迟滞（℃） |
 | `APP_MODE4_PEAK_TRACK_MS` | 500 | 断电后峰值跟踪窗口（ms） |
 
-本实现选择纯 RAM 方案，不向 NVS 写入学习结果。每次上电都从 `APP_MODE4_HEAT_TIME_DEFAULT_MS` 重新学习；`SP`/`SETPOINT` 或 `HTIME` 命令也会将两路工作值恢复为当前基准值并返回稳定阶段。
+**复位与保护语义：**
+
+- 学习结果和 `HTIME` 基准值都只保存在 RAM，不写入 NVS；每次上电从默认 200ms 重新学习。
+- 每收到一次有效 `SP`/`SETPOINT` 或 `HTIME` 命令，配置版本都会递增，即使数值与当前值相同，也会让两路状态机回到 `STABILIZE`，清除 PID 历史和学习结果。
+- 某控制组的两路 NTC 均无效、欠压或 OTA 挂起时，本周期输出立即变为 0，正在执行的脉冲被丢弃，恢复后必须重新完成低温稳定确认，不会续跑旧脉冲。若该组仍有一路 NTC 有效，则继续使用该路温度。
+- 任何上述扰动都会清除“连续稳定”计时。若欠压在阈值附近反复翻转，稳定计时会反复从头开始，模式 4 可以长期停在 `STABILIZE`；这是避免不稳定供电下启动全功率脉冲的有意安全策略。
+- 稳定计时使用独立布尔活动标志，不把时间戳 0 当作“未启动”哨兵，可正确处理 32 位毫秒计数回绕。
 
 ### 4.5 引脚与总线定义
 
@@ -448,10 +489,14 @@ t=16s: CH1 降至 35.0℃ → 回到 MODE3_CH0_HEAT
 | --- | --- | --- |
 | `APP_WIFI_SSID` | "ESP32" | WiFi 热点 SSID |
 | `APP_WIFI_PASSWORD` | "12345678" | WiFi 热点密码 |
-| `APP_WIFI_MAX_RETRY` | 10 | WiFi 断线最大重连次数 |
-| `APP_UDP_REMOTE_IP` | "10.92.90.124" | 上位机 UDP 远端 IP 地址 |
+| `APP_WIFI_MAX_RETRY` | 10 | WiFi 断线后的快速重连次数 |
+| `APP_WIFI_RETRY_PERIOD_MS` | 60000 | 快速重连用尽后的慢速重连周期（ms） |
+| `APP_UDP_REMOTE_IP` | "192.168.137.1" | 上位机 UDP 远端 IP 地址 |
 | `APP_UDP_REMOTE_PORT` | 6000 | 上位机 UDP 远端端口 |
 | `APP_UDP_LOCAL_PORT` | 6001 | ESP32 本地 UDP 监听端口 |
+| `APP_UDP_RECEIVE_TIMEOUT_MS` | 200 | UDP 命令接收超时，socket 创建时设置一次 |
+
+WiFi 重连分为两个阶段：每次断线先立即执行最多 `APP_WIFI_MAX_RETRY` 次快速连接；次数用尽后启动周期定时器，每隔 `APP_WIFI_RETRY_PERIOD_MS` 再发起一次连接。成功获取 IP 后停止周期定时器并将快速重试计数清零，因此后续再次断线时仍从快速重试阶段开始。慢速重试不会因达到某个总次数而永久停止。
 
 ### 4.11 OTA 参数
 
@@ -632,11 +677,11 @@ $$P_{kPa} = \frac{V_{out} - 0.2}{0.0188}$$
 
 其中还原后的传感器电压 `V_out = V_adc × APP_PRESSURE_DC_VOUT_SCALE`（默认 scale=2.0）。
 
-`periph_pressure_dc_read()` 函数封装了完整采样链路。负压结果被钳位为 0。
+`periph_pressure_dc_read_channel()` 函数根据传入的 ADC 命令封装完整采样链路。负压结果被钳位为 0。
 
 ### 9.4 通道选择
 
-通过 `FEATURE_PRESSURE_DC_CH1` / `FEATURE_PRESSURE_DC_CH2` 选择通道，`pressure_config.h` 在编译期检查恰好选一个通道，并根据选择推导 `APP_PRESSURE_DC_ADC_CMD` 宏：
+通过 `FEATURE_PRESSURE_DC_CH1` / `FEATURE_PRESSURE_DC_CH2` 选择通道。DC 压力源启用时至少要选择一路，也可同时采集两路：
 
 - CH1 → `APP_EXT_ADC_CMD_Press1` (0xF4, ADC CH7)
 - CH2 → `APP_EXT_ADC_CMD_Press2` (0x84, ADC CH0)
@@ -672,11 +717,8 @@ LEDC duty = (占空比 / 100) × 1023
 | `periph_pwm_init()` | 初始化定时器和通道，上电默认关断 |
 | `periph_pwm_set_on_time_ms_ch(ch, ms)` | 设置单通道导通时间（0~1000ms） |
 | `periph_pwm_set_on_time_ms(ms)` | 设置双通道同步导通时间 |
-| `periph_pwm_set_percent(%)` | 设置双通道占空比（0~100%） |
 | `periph_pwm_force_off_ch(ch)` | 强制关断单通道输出 |
 | `periph_pwm_force_off()` | 强制关断双通道输出 |
-| `periph_pwm_get_on_time_ms()` | 读取 CH0 最后一次设置的导通时间 |
-| `periph_pwm_get_percent()` | 读取 CH0 最后一次设置的占空比 |
 
 ---
 
@@ -708,22 +750,31 @@ LEDC duty = (占空比 / 100) × 1023
 
 | CMD ID | 宏名称 | 描述 | 载荷格式 | 字节数 |
 | --- | --- | --- | --- | --- |
-| 0x01 | `COMM_CMD_NTC` | NTC 控制反馈温度 | int16 CH0 平均温度(℃×100) + (可选) int16 CH1 平均温度(℃×100) | 0/2/4 |
+| 0x01 | `COMM_CMD_NTC` | PWM 控制反馈温度 | 有效通道按 PWM0、PWM1 顺序依次写入 int16 温度(℃×100) | 0/2/4 |
 | 0x02 | `COMM_CMD_WF5803F` | WF5803F 温压数据 | int16 温度(℃×100) + int32 压力(kPa×100) | 6 |
 | 0x03 | `COMM_CMD_VOLTAGE` | 电源电压状态 | int16 电压(V×100) + uint8 状态(0xFF=欠压, 0x01=正常) | 3 |
-| 0x04 | `COMM_CMD_PID_OUT` | PID 输出值 | int32×2：PWM CH1 输出(ms×100) + PWM CH0 输出(ms×100) | 8 |
-| 0x05 | `COMM_CMD_PRESSURE` | 压力数据 | int32 压力(kPa×100) | 4 |
-| 0x0F | `COMM_CMD_TEXT_INFO` | 文本信息 | ASCII 字符串 | 变长 |
+| 0x04 | `COMM_CMD_PID_OUT` | PID 输出值 | int32×2：PWM CH0 输出(ms×100) + PWM CH1 输出(ms×100) | 8 |
+| 0x05 | `COMM_CMD_PRESSURE` | DC 压力数据 | uint8 mask + 按 mask 动态携带 CH1/CH2 的 int32 压力(kPa×100) | 5/9 |
+| 0x0F | `COMM_CMD_TEXT_INFO` | 文本信息（预留） | 当前代码保留命令 ID，但不主动组帧发送 | — |
 
 **CMD_NTC 通道约定**：
 - CH0（载荷中第一个 int16）：PWM CH0 对应控制组（Group 1 = NTC2/NTC3）的平均反馈温度
 - CH1（载荷中第二个 int16）：PWM CH1 对应控制组（Group 0 = NTC0/NTC1）的平均反馈温度
 - 每通道平均规则：双 NTC 都有效取平均，单 NTC 有效取单值，都无效则该通道不写入载荷
 - 两通道都无效时整个帧不发送（payload 长度为 0）
+- CMD_NTC 没有有效位掩码：只有一路有效时载荷只有 2 字节，接收端需结合设备启用配置判断它属于哪一物理 PWM 通道
 
 **CMD_PID_OUT 顺序约定**：
-- 第一个 int32：PWM CH1 输出（ms×100）—— 对应控制组 0
-- 第二个 int32：PWM CH0 输出（ms×100）—— 对应控制组 1
+- 第一个 int32：PWM CH0 输出（ms×100）—— 对应控制组 1
+- 第二个 int32：PWM CH1 输出（ms×100）—— 对应控制组 0
+- 这里按物理 PWM 通道编号排列，不按控制组编号排列；控制组与 PWM 通道的对应关系以 `s_group_map` 为准
+
+**CMD_PRESSURE 动态载荷约定**：
+
+- 第 1 字节为 `mask`：bit0=DC 压力 CH1 有效，bit1=DC 压力 CH2 有效。
+- 若 bit0=1，紧随其后写入 CH1 的小端 int32；若 bit1=1，再写入 CH2 的小端 int32。
+- 两路都有效时固定为 `mask + CH1 + CH2`，共 9 字节；仅一路有效时为 5 字节。
+- `pressure_mask=0` 时不发送该帧。WF5803F 使用独立的 `COMM_CMD_WF5803F` 帧，不使用此动态格式。
 
 ### 11.4 数据缩放与类型转换
 
@@ -755,6 +806,7 @@ LEDC duty = (占空比 / 100) × 1023
 2. 去除首尾空白字符
 3. 转为大写（大小写不敏感匹配）
 4. 按优先级匹配关键字
+5. `apply_command()` 对需要数值的命令执行运行期合法性检查，通过后才修改共享状态或 PID 参数
 
 ### 12.3 支持的命令列表
 
@@ -770,9 +822,12 @@ LEDC duty = (占空比 / 100) × 1023
 | `HTIME=xx` | — | 模式 4 基准加热时长 | 20~1000ms | 修改 RAM 基准值，两路工作值复位后重新稳定 |
 
 **注意事项**：
-- 任何合法命令（包括心跳）都更新最后心跳时间戳 `last_heartbeat_ms`
+- 任何被解析器识别的命令（包括心跳，以及随后因数值非法而被拒绝的命令）都会先更新最后心跳时间戳 `last_heartbeat_ms`
 - SETPOINT/KP/KI/KD/ILIMIT/HTIME 命令对两路控制组同步生效（无法单独控制一路）
 - KI 参数修改时，两路 PID 的积分项同时清零
+- SETPOINT/KP/KI/KD/ILIMIT 拒绝 `NaN`、正负无穷等非有限值，防止非法浮点数进入 PID 和 PWM 浮点转整数链路
+- HTIME 除了要求有限，还必须位于 `APP_MODE4_HEAT_TIME_MIN_MS` 到 `APP_MODE4_HEAT_TIME_MAX_MS` 范围内（默认 20~1000ms）
+- 被拒绝的数值命令不会修改控制参数；串口记录警告。高频 `HB` 仅更新时间戳，不打印整行 PID 参数状态，避免刷屏
 - 命令解析失败（未知命令）时静默忽略，不影响系统运行
 
 ---
@@ -813,7 +868,7 @@ ota_task (500ms 周期)
 
 | 保护机制 | 触发条件 | 动作 | 恢复条件 |
 | --- | --- | --- | --- |
-| 心跳失联保护 | 上位机心跳超时（默认 5s） | 目标温度降级到安全值（默认 30℃） | 收到新心跳命令 |
+| 心跳失联保护 | 无线和 `FEATURE_HEARTBEAT_FAILSAFE_ENABLE` 均开启，且上位机命令超时（默认 5s） | 目标温度降级到安全值（默认 30℃）；当前默认关闭此保护 | 收到任一可解析命令 |
 | 欠压保护 | 电源电压 < 20V | 两路 PWM 强制输出 0 | 电压恢复到 ≥ 20V |
 | OTA 温度门禁 | 过程温度 > 45℃ | 拒绝执行 OTA | 温度降至 ≤ 45℃ 后重新触发 OTA 命令 |
 | OTA 前 PWM 关断 | OTA 开始执行 | 两路 PWM 强制输出 0 | OTA 完成自动重启 |
@@ -821,6 +876,9 @@ ota_task (500ms 周期)
 | PID 输出限幅 | 输出超出 [0, 1000] ms | 钳位到边界值 | 计算输出回到范围内 |
 | 上电零输出 | 上电阶段 Kp/Ki/Kd=0 | PWM 输出为 0 | 控制任务启动后加载运行参数 |
 | 传感器失效保护 | NTC 测温无效 | 对应控制组 PWM 关断 | NTC 恢复有效读数 |
+| 模式 4 过温保护 | HEAT 阶段温度 ≥ T_high+3℃ | 立即结束脉冲并进入 COOL | 冷却条件满足后进入下一轮 |
+| 模式 4 相对超时 | HEAT 阶段耗时 ≥ 当前脉冲时长×2 | 立即结束脉冲并记录警告 | 冷却条件满足后进入下一轮 |
+| 模式 4 扰动复位 | 欠压、OTA 挂起或该组两路 NTC 均无效 | 输出 0、丢弃当前脉冲并清除稳定计时 | 扰动解除后重新完整稳定 1000ms |
 
 ---
 
@@ -830,16 +888,17 @@ ota_task (500ms 周期)
 
 ```
 T0=<℃> V0=<V> T1=<℃> V1=<V> T2=<℃> V2=<V> T3=<℃> V3=<V>
-WF_T=<℃> P=<kPa> Psrc=<WF/DC/OFF> V=<supply_V>
+WF_T=<℃> P1=<kPa> P2=<kPa> Psrc=<WF/DC/OFF> V=<supply_V>
 PWM0=<ms> PWM1=<ms> SP0=<℃> SP1=<℃> SAFE=<0/1>
 ```
 
 - `T0~T3` / `V0~V3`：四路 NTC 温度（℃）和电压（V），无效通道显示 0.00
-- `WF_T` / `P`：WF5803F 温度和压力，无效时显示 NaN
+- `WF_T`：WF5803F 温度；未启用或无效时显示 NaN
+- `P1/P2`：压力值。WF 来源只使用 P1；DC 来源分别对应 CH1/CH2，无效通道显示 NaN
 - `Psrc`：压力数据来源 — `WF`（WF5803F）、`DC`（DC 电压型）、`OFF`（压力功能关闭）
 - `supply_V`：电源输入电压（V）
-- `PWM0/PWM1`：两路 PWM 导通时间（ms）
-- `SP0/SP1`：两路 PID 当前有效设定值（℃）。模式 1 固定等于 `requested_sp`；模式 2 在 T_low/T_high 之间循环切换；模式 3 根据互锁状态在 T_low/T_high 之间交替
+- 串口日志中的 `PWM0/PWM1` 当前按控制组数组下标输出：`PWM0` 表示 Group 0（物理 PWM1），`PWM1` 表示 Group 1（物理 PWM0）。二进制 `CMD_PID_OUT` 帧则严格按物理 PWM0、PWM1 排列；调试时不要混淆这两种编号
+- `SP0/SP1`：按控制组 0/1 输出的当前有效低温/目标设定值（℃）。模式 1 固定等于 `requested_sp`；模式 2 在 T_low/T_high 间切换；模式 3 根据互锁状态交替；模式 4 显示各组的 T_low，HEAT/COOL 阶段实际输出由状态机直接决定
 - `SAFE`：是否处于心跳失联安全模式（0=正常，1=安全模式）
 
 ### 15.2 UDP 上报帧
@@ -850,7 +909,7 @@ PWM0=<ms> PWM1=<ms> SP0=<℃> SP1=<℃> SAFE=<0/1>
 2. **CMD_WF5803F (0x02)**：WF5803F 温度与压力（若 WF5803F 使能且数据有效）
 3. **CMD_PRESSURE (0x05)**：DC 压力传感器数据（若 DC 来源使能且数据有效）
 4. **CMD_VOLTAGE (0x03)**：电源电压与欠压状态（若电压监测使能）
-5. **CMD_PID_OUT (0x04)**：两路 PID 输出导通时间（若 PID 输出上报使能）
+5. **CMD_PID_OUT (0x04)**：两路实际控制输出导通时间，固定按 PWM0、PWM1 排列（模式 4 中也可能是 1000ms 或 0ms）
 
 UDP 发送失败不阻塞主流程，由下个周期继续尝试发送。
 
@@ -908,6 +967,8 @@ idf.py build flash monitor  # 一键编译+烧录+监视
 - 确认 WiFi SSID 和密码与实际热点一致
 - 确认上位机 IP 地址和端口配置正确
 - 检查 WiFi 最大重试次数 `APP_WIFI_MAX_RETRY`（默认 10 次）
+- 快速重试用尽后设备不会永久离线，而是每 60 秒继续尝试；串口出现 `wifi slow reconnect attempt` 表示慢速恢复机制正在工作
+- 获取 IP 后慢速定时器会停止，并恢复下一次断线可用的 10 次快速重试
 
 ### 17.4 PID 控制异常（不加热或过热）
 
@@ -933,6 +994,21 @@ idf.py build flash monitor  # 一键编译+烧录+监视
 - 确认总线上无地址冲突（外部 ADC 和 WF5803F 地址不同）
 - 可用逻辑分析仪或示波器检查 I2C 波形
 
+### 17.7 模式 4 一直停在稳定阶段
+
+- 确认过程温度能连续 1000ms 保持在 `T_low ± APP_CYCLIC_HOLD_THRESHOLD_C` 内；短暂离开范围会重新计时
+- 检查该控制组是否至少有一路 NTC 持续有效；只有该组所有温度源都无效时，才会清除稳定计时
+- 检查电源是否在 20V 欠压阈值附近抖动；每次欠压都会关断输出并要求重新完整确认稳定
+- 检查是否存在尚未处理完的 OTA 请求
+- 确认 `T_high` 严格大于运行时 `T_low`，否则系统只运行低温 PID，不进入脉冲
+
+### 17.8 模式 4 峰值不收敛
+
+- 查看 `mode4 ... adapt` 日志中的峰值、升温斜率、修正量和新脉冲时长
+- 若出现 `invalid heating slope`，检查加热器输出、NTC 响应方向及采样噪声
+- 若出现脉冲时长达到 1000ms 的饱和警告，说明当前功率或热耦合可能不足以达到 T_high
+- `SP`、`SETPOINT`、`HTIME` 命令都会清除已有收敛状态；频繁发送这些配置命令会导致反复重新学习
+
 ---
 
 ## 18. 附录
@@ -943,11 +1019,19 @@ idf.py build flash monitor  # 一键编译+烧录+监视
 
 - `FEATURE_PRESSURE_SOURCE` 必须为 0 或 1
 - 若来源为 WF5803F（`FEATURE_PRESSURE_SOURCE=1`），则 `FEATURE_WF5803F_ENABLE` 必须为 1
-- 若来源为 DC 电压型（`FEATURE_PRESSURE_SOURCE=0`），则 `FEATURE_PRESSURE_DC_CH1` 和 `FEATURE_PRESSURE_DC_CH2` 中有且仅有一个为 1
+- 若来源为 DC 电压型（`FEATURE_PRESSURE_SOURCE=0`），则 `FEATURE_PRESSURE_DC_CH1` 和 `FEATURE_PRESSURE_DC_CH2` 至少一个为 1；允许两路同时启用
 
 `main.c` 在编译期校验：
 - `APP_NTC_FILTER_WINDOW_SIZE` 必须 ≥ 1
 - `APP_NTC_SAMPLE_PERIOD_MS` 必须 ≥ 1
+- 模式 4 峰值容差必须 ≥ 1℃
+- 模式 4 最小脉冲时长必须大于 0，默认时长必须位于最小/最大边界内
+- 模式 4 相对超时倍数必须 ≥ 1
+
+`comm_udp.c` 在编译期校验：
+
+- `APP_UDP_RECEIVE_TIMEOUT_MS` 必须 ≥ 1ms
+- `APP_WIFI_RETRY_PERIOD_MS` 必须 ≥ 1000ms
 
 配置不合法时产生 `#error` 编译错误，提前暴露问题。
 

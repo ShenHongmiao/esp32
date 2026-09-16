@@ -85,6 +85,20 @@ static const control_group_map_t s_group_map[APP_CONTROL_GROUPS] = {
 	{2, 3, 0},
 };
 
+typedef struct {
+	uint8_t adc_cmd;
+	bool enabled;
+} ntc_sample_config_t;
+
+// 四路 NTC 的 ADC 命令和编译期使能集中在同一张表中。
+// 采样任务只遍历此表，避免四段结构相同的条件编译代码逐渐失配。
+static const ntc_sample_config_t s_ntc_sample_config[4] = {
+	{APP_EXT_ADC_CMD_NTC0, FEATURE_NTC_CH0_ENABLE != 0},
+	{APP_EXT_ADC_CMD_NTC1, FEATURE_NTC_CH1_ENABLE != 0},
+	{APP_EXT_ADC_CMD_NTC2, FEATURE_NTC_CH2_ENABLE != 0},
+	{APP_EXT_ADC_CMD_NTC3, FEATURE_NTC_CH3_ENABLE != 0},
+};
+
 #if APP_NTC_FILTER_WINDOW_SIZE < 1
 #error "APP_NTC_FILTER_WINDOW_SIZE must be >= 1"
 #endif
@@ -107,10 +121,14 @@ static app_runtime_t s_state;
 static ctrl_pid_t s_pid[APP_CONTROL_GROUPS];
 static ctrl_failsafe_t s_failsafe;
 static ntc_filter_state_t s_ntc_filter;
+#if FEATURE_HEATING_MODE == 2
 static uint8_t s_cyclic_stage[APP_CONTROL_GROUPS] = {1, 1};
 static uint32_t s_cyclic_hold_start_ms[APP_CONTROL_GROUPS];
+static bool s_cyclic_hold_active[APP_CONTROL_GROUPS];
+#endif
 static float s_last_target_sp[APP_CONTROL_GROUPS] = {APP_DEFAULT_SETPOINT_C, APP_DEFAULT_SETPOINT_C};
 
+#if FEATURE_HEATING_MODE == 3
 // 模式 3 状态机定义：双通道互锁交替。
 typedef enum {
     MODE3_CH0_HEAT,   // CH0 加热（目标高温），CH1 冷却（目标低温）
@@ -119,7 +137,9 @@ typedef enum {
     MODE3_CH1_COOL,   // CH1 已到高温，等待 CH1 降温到触发点
 } mode3_state_t;
 static mode3_state_t s_mode3_state = MODE3_CH0_HEAT;
+#endif
 
+#if FEATURE_HEATING_MODE == 4
 // 模式 4 每个控制组都使用一套完全独立的三态状态机，两路之间不互锁。
 typedef enum {
 	MODE4_STABILIZE = 0, // 用 PID 将过程温度稳定在 T_low。
@@ -131,6 +151,7 @@ typedef struct {
 	mode4_state_id_t state;
 	uint32_t state_enter_ms;
 	uint32_t stable_start_ms;
+	bool stable_timer_active;
 	uint32_t applied_config_revision;
 	float configured_low_c;
 	float heat_time_base_ms;
@@ -145,7 +166,6 @@ typedef struct {
 
 static mode4_group_state_t s_mode4[APP_CONTROL_GROUPS];
 
-#if FEATURE_HEATING_MODE == 4
 // 将需求文档中与 20ms 控制分辨率直接相关的硬约束变成编译期检查，
 // 防止日后调参时将峰值容差设得过小，导致脉冲在相邻周期之间往复振荡。
 _Static_assert(APP_CONTROL_PERIOD_MS > 0, "mode4 requires a positive control period");
@@ -190,15 +210,36 @@ static void runtime_init(void) {
 	s_state.pressure_mask = 0;
 }
 
-static float select_process_temperature_group(const app_runtime_t *sample, uint8_t primary, uint8_t secondary) {
-	// 控制温度源优先级：主通道优先，备用通道回退。
-	if (sample->ntc_valid[primary]) {
-		return sample->ntc_temp_c[primary];
+static bool get_group_average_temperature(const app_runtime_t *sample,
+										 uint32_t group,
+										 float *out_temp_c) {
+	// 控制与遥测共用同一个分组求平均实现，分组关系只从 s_group_map 读取。
+	// 任一传感器有效时即可返回该组温度；两个都有效时取算术平均。
+	if (sample == NULL || out_temp_c == NULL || group >= APP_CONTROL_GROUPS) {
+		return false;
 	}
-	if (sample->ntc_valid[secondary]) {
-		return sample->ntc_temp_c[secondary];
+
+	const uint8_t channels[2] = {
+		s_group_map[group].primary_ntc,
+		s_group_map[group].secondary_ntc,
+	};
+	float sum = 0.0f;
+	uint32_t valid_count = 0U;
+	for (uint32_t i = 0; i < 2U; ++i) {
+		const uint8_t channel = channels[i];
+		if (sample->ntc_valid[channel]) {
+			sum += sample->ntc_temp_c[channel];
+			valid_count++;
+		}
 	}
-	return NAN;
+
+	if (valid_count == 0U) {
+		*out_temp_c = NAN;
+		return false;
+	}
+
+	*out_temp_c = sum / (float)valid_count;
+	return true;
 }
 
 static void ntc_filter_reset(ntc_filter_state_t *filter) {
@@ -218,6 +259,7 @@ static void ntc_filter_reset(ntc_filter_state_t *filter) {
 	}
 }
 
+#if FEATURE_HEATING_MODE == 2
 static float update_cyclic_setpoint_group(uint32_t group,
 									float stage1_setpoint,
 									float process_temp,
@@ -237,19 +279,21 @@ static float update_cyclic_setpoint_group(uint32_t group,
 	}
 
 	if (stable) {
-		if (s_cyclic_hold_start_ms[group] == 0U) {
+		if (!s_cyclic_hold_active[group]) {
 			s_cyclic_hold_start_ms[group] = now_ms;
+			s_cyclic_hold_active[group] = true;
 		} else if ((now_ms - s_cyclic_hold_start_ms[group]) >= APP_CYCLIC_HOLD_TIME_MS) {
 			s_cyclic_stage[group] = (s_cyclic_stage[group] == 1U) ? 2U : 1U;
-			s_cyclic_hold_start_ms[group] = 0U;
+			s_cyclic_hold_active[group] = false;
 			target = (s_cyclic_stage[group] == 2U) ? APP_CYCLIC_SETPOINT2_C : stage1_setpoint;
 		}
 	} else {
-		s_cyclic_hold_start_ms[group] = 0U;
+		s_cyclic_hold_active[group] = false;
 	}
 
 	return target;
 }
+#endif
 
 static bool sample_ntc_voltage_channel(uint8_t channel, uint8_t adc_cmd, float *out_voltage_v) {
 	uint16_t raw = 0;
@@ -294,42 +338,32 @@ static void sample_non_ntc_peripherals(app_runtime_t *sample) {
 #endif
 
 #if APP_PRESSURE_SOURCE_DC
-	// 读取 DC 电压型压力传感器。
-	float local_kpa_ch1 = 0.0f;
-	float local_kpa_ch2 = 0.0f;
-	uint8_t local_mask = 0;
+	// 压力外设层统一完成 ADC 读取、分压还原、kPa 换算和负值钳位。
+	// 本层只遍历启用的逻辑通道并记录有效位，不再复制硬件换算公式。
+	static const uint8_t pressure_adc_cmd[2] = {
+		APP_EXT_ADC_CMD_Press1,
+		APP_EXT_ADC_CMD_Press2,
+	};
+	static const bool pressure_enabled[2] = {
+		APP_PRESSURE_DC_CH1 != 0,
+		APP_PRESSURE_DC_CH2 != 0,
+	};
+	float pressure_kpa[2] = {0.0f, 0.0f};
+	sample->pressure_mask = 0U;
 
-#if FEATURE_PRESSURE_DC_CH1
-	uint16_t raw1 = 0;
-	if (periph_adc_read_raw12(APP_EXT_ADC_CMD_Press1, &raw1) == ESP_OK) {
-		float v1 = periph_adc_raw12_to_voltage(raw1, APP_ADC_VREF_V) * APP_PRESSURE_DC_VOUT_SCALE;
-		float p1 = periph_pressure_dc_voltage_to_kpa(v1);
-		if (p1 < 0.0f) {
-			p1 = 0.0f;
+	for (uint32_t channel = 0; channel < 2U; ++channel) {
+		if (!pressure_enabled[channel]) {
+			continue;
 		}
-		local_kpa_ch1 = p1;
-		local_mask |= 0x01;
-	}
-#endif
-
-#if FEATURE_PRESSURE_DC_CH2
-	uint16_t raw2 = 0;
-	if (periph_adc_read_raw12(APP_EXT_ADC_CMD_Press2, &raw2) == ESP_OK) {
-		float v2 = periph_adc_raw12_to_voltage(raw2, APP_ADC_VREF_V) * APP_PRESSURE_DC_VOUT_SCALE;
-		float p2 = periph_pressure_dc_voltage_to_kpa(v2);
-		if (p2 < 0.0f) {
-			p2 = 0.0f;
+		periph_pressure_dc_sample_t pressure_sample = {0};
+		if (periph_pressure_dc_read_channel(pressure_adc_cmd[channel], &pressure_sample) == ESP_OK) {
+			pressure_kpa[channel] = pressure_sample.pressure_kpa;
+			sample->pressure_mask |= (uint8_t)(1U << channel);
 		}
-		local_kpa_ch2 = p2;
-		local_mask |= 0x02;
 	}
-#endif
 
-	xSemaphoreTake(s_state_lock, portMAX_DELAY);
-	s_state.dc_pressure_kpa_ch1 = local_kpa_ch1;
-	s_state.dc_pressure_kpa_ch2 = local_kpa_ch2;
-	s_state.pressure_mask = local_mask;
-	xSemaphoreGive(s_state_lock);
+	sample->dc_pressure_kpa_ch1 = pressure_kpa[0];
+	sample->dc_pressure_kpa_ch2 = pressure_kpa[1];
 #endif
 
 #if FEATURE_WF5803F_ENABLE
@@ -363,22 +397,14 @@ static void sampling_task(void *arg) {
 		bool sampled_valid[4] = {false};
 		app_runtime_t sensor_snapshot = slow_sample;
 
-#if FEATURE_NTC_CH0_ENABLE
-		sampled_valid[0] =
-			sample_ntc_voltage_channel(0U, APP_EXT_ADC_CMD_NTC0, &sampled_voltage_v[0]);
-#endif
-#if FEATURE_NTC_CH1_ENABLE
-		sampled_valid[1] =
-			sample_ntc_voltage_channel(1U, APP_EXT_ADC_CMD_NTC1, &sampled_voltage_v[1]);
-#endif
-#if FEATURE_NTC_CH2_ENABLE
-		sampled_valid[2] =
-			sample_ntc_voltage_channel(2U, APP_EXT_ADC_CMD_NTC2, &sampled_voltage_v[2]);
-#endif
-#if FEATURE_NTC_CH3_ENABLE
-		sampled_valid[3] =
-			sample_ntc_voltage_channel(3U, APP_EXT_ADC_CMD_NTC3, &sampled_voltage_v[3]);
-#endif
+		for (uint32_t ch = 0; ch < 4U; ++ch) {
+			if (s_ntc_sample_config[ch].enabled) {
+				sampled_valid[ch] = sample_ntc_voltage_channel(
+					(uint8_t)ch,
+					s_ntc_sample_config[ch].adc_cmd,
+					&sampled_voltage_v[ch]);
+			}
+		}
 
 		for (uint32_t ch = 0; ch < 4; ++ch) {
 			if (sampled_valid[ch]) {
@@ -410,6 +436,9 @@ static void sampling_task(void *arg) {
 			sensor_snapshot.wf_valid = slow_sample.wf_valid;
 			sensor_snapshot.supply_voltage_v = slow_sample.supply_voltage_v;
 			sensor_snapshot.undervoltage = slow_sample.undervoltage;
+			sensor_snapshot.dc_pressure_kpa_ch1 = slow_sample.dc_pressure_kpa_ch1;
+			sensor_snapshot.dc_pressure_kpa_ch2 = slow_sample.dc_pressure_kpa_ch2;
+			sensor_snapshot.pressure_mask = slow_sample.pressure_mask;
 			slow_sample_counter = 0;
 		}
 
@@ -424,6 +453,9 @@ static void sampling_task(void *arg) {
 		s_state.wf_valid = sensor_snapshot.wf_valid;
 		s_state.supply_voltage_v = sensor_snapshot.supply_voltage_v;
 		s_state.undervoltage = sensor_snapshot.undervoltage;
+		s_state.dc_pressure_kpa_ch1 = sensor_snapshot.dc_pressure_kpa_ch1;
+		s_state.dc_pressure_kpa_ch2 = sensor_snapshot.dc_pressure_kpa_ch2;
+		s_state.pressure_mask = sensor_snapshot.pressure_mask;
 		xSemaphoreGive(s_state_lock);
 
 		vTaskDelayUntil(&sys_tick_count_sample, sample_period_ticks);
@@ -436,41 +468,36 @@ static void apply_command(const comm_command_t *cmd) {
 		return;
 	}
 
-	// 任何合法命令都视为“收到心跳”。
+	bool command_accepted = true;
+	bool print_status_log = true;
+
+	// 任何能被解析的命令都先刷新心跳时间。共享状态和 PID 参数的修改都在同一个锁内完成。
 	xSemaphoreTake(s_state_lock, portMAX_DELAY);
 	s_state.last_heartbeat_ms = app_now_ms();
 
-	// 根据命令类型更新控制目标或控制器参数。
+	// 先处理全局命令。PID 参数命令留给下方的统一通道循环，避免每个 case 复制循环框架。
 	switch (cmd->type) {
 		case COMM_COMMAND_HEARTBEAT:
+			// 心跳可能高频到达，只刷新时间戳，不生成全量 INFO 日志。
+			print_status_log = false;
 			break;
 		case COMM_COMMAND_SETPOINT:
+			if (!isfinite(cmd->value)) {
+				command_accepted = false;
+				break;
+			}
 			s_state.requested_setpoint_c = cmd->value;
 			// 模式 4 规定：收到温度命令就必须丢弃已学习的工作时长并重新稳定。
 			// 使用事件版本号而不是仅比较浮点值，以便 SP=50 连续发送两次也能复位。
 			s_state.mode4_config_revision++;
 			break;
 		case COMM_COMMAND_KP:
-			for (uint32_t group = 0; group < APP_CONTROL_GROUPS; ++group) {
-				s_pid[group].kp = cmd->value;
-			}
-			break;
 		case COMM_COMMAND_KI:
-			for (uint32_t group = 0; group < APP_CONTROL_GROUPS; ++group) {
-				if (s_pid[group].ki != cmd->value) {
-					s_pid[group].ki = cmd->value;
-					s_pid[group].integral = 0.0f;
-				}
-			}
-			break;
 		case COMM_COMMAND_KD:
-			for (uint32_t group = 0; group < APP_CONTROL_GROUPS; ++group) {
-				s_pid[group].kd = cmd->value;
-			}
-			break;
 		case COMM_COMMAND_ILIMIT:
-			for (uint32_t group = 0; group < APP_CONTROL_GROUPS; ++group) {
-				ctrl_pid_set_integral_limit(&s_pid[group], cmd->value);
+			// 任何非有限 PID 参数都会污染计算链，并可能在 PWM/遥测换算时触发非法浮点转整数。
+			if (!isfinite(cmd->value)) {
+				command_accepted = false;
 			}
 			break;
 		case COMM_COMMAND_HTIME:
@@ -482,18 +509,44 @@ static void apply_command(const comm_command_t *cmd) {
 				s_state.mode4_heat_time_base_ms = cmd->value;
 				s_state.mode4_config_revision++;
 			} else {
-				ESP_LOGW(TAG,
-						 "reject HTIME=%.3fms, valid range is %.1f..%.1fms",
-						 cmd->value,
-						 APP_MODE4_HEAT_TIME_MIN_MS,
-						 APP_MODE4_HEAT_TIME_MAX_MS);
+				command_accepted = false;
 			}
 			break;
 		case COMM_COMMAND_OTA:
 			s_state.ota_pending = true;
 			break;
 		default:
+			command_accepted = false;
+			print_status_log = false;
 			break;
+	}
+
+	// 所有 PID 参数命令通过这一个循环同步到两个控制组。
+	// KI 仍保留“数值变化时清积分”的原有语义，ILIMIT 仍通过专用函数处理绝对值。
+	if (command_accepted &&
+		(cmd->type == COMM_COMMAND_KP || cmd->type == COMM_COMMAND_KI ||
+		 cmd->type == COMM_COMMAND_KD || cmd->type == COMM_COMMAND_ILIMIT)) {
+		for (uint32_t group = 0; group < APP_CONTROL_GROUPS; ++group) {
+			switch (cmd->type) {
+				case COMM_COMMAND_KP:
+					s_pid[group].kp = cmd->value;
+					break;
+				case COMM_COMMAND_KI:
+					if (s_pid[group].ki != cmd->value) {
+						s_pid[group].ki = cmd->value;
+						s_pid[group].integral = 0.0f;
+					}
+					break;
+				case COMM_COMMAND_KD:
+					s_pid[group].kd = cmd->value;
+					break;
+				case COMM_COMMAND_ILIMIT:
+					ctrl_pid_set_integral_limit(&s_pid[group], cmd->value);
+					break;
+				default:
+					break;
+			}
+		}
 	}
 
 	const float sp = s_state.requested_setpoint_c;
@@ -507,7 +560,25 @@ static void apply_command(const comm_command_t *cmd) {
 
 	xSemaphoreGive(s_state_lock);
 
-	// 打印命令和当前关键参数，便于联调追踪。
+	if (!command_accepted) {
+		if (cmd->type == COMM_COMMAND_HTIME) {
+			ESP_LOGW(TAG,
+					 "reject HTIME=%.3fms, valid range is %.1f..%.1fms",
+					 cmd->value,
+					 APP_MODE4_HEAT_TIME_MIN_MS,
+					 APP_MODE4_HEAT_TIME_MAX_MS);
+		} else if (cmd->type == COMM_COMMAND_SETPOINT || cmd->type == COMM_COMMAND_KP ||
+				   cmd->type == COMM_COMMAND_KI || cmd->type == COMM_COMMAND_KD ||
+				   cmd->type == COMM_COMMAND_ILIMIT) {
+			ESP_LOGW(TAG, "reject non-finite command: cmd=%d value=%f", cmd->type, cmd->value);
+		}
+		return;
+	}
+	if (!print_status_log) {
+		return;
+	}
+
+	// 只有实际改变配置的命令才打印完整状态，避免心跳日志占用串口和任务时间。
 	ESP_LOGI(TAG,
 			 "cmd=%d value=%.3f sp=%.2f mode4_base=%.1fms kp0=%.2f ki0=%.2f kd0=%.2f kp1=%.2f ki1=%.2f kd1=%.2f",
 			 cmd->type,
@@ -522,6 +593,7 @@ static void apply_command(const comm_command_t *cmd) {
 			 kd1);
 }
 
+#if FEATURE_HEATING_MODE == 3
 static void update_mode3_setpoints(float proc_temp_ch0, bool valid_ch0,
                                     float proc_temp_ch1, bool valid_ch1,
                                     float requested_sp,
@@ -568,7 +640,9 @@ static void update_mode3_setpoints(float proc_temp_ch0, bool valid_ch0,
             break;
     }
 }
+#endif
 
+#if FEATURE_HEATING_MODE == 4
 static float mode4_clampf(float value, float min_value, float max_value) {
 	// 模式 4 内部使用的通用限幅，保证时长和单次修正量始终处于安全范围。
 	if (value < min_value) {
@@ -590,6 +664,7 @@ static void mode4_reset_group(uint32_t group,
 	ctx->state = MODE4_STABILIZE;
 	ctx->state_enter_ms = app_now_ms();
 	ctx->stable_start_ms = 0U;
+	ctx->stable_timer_active = false;
 	ctx->applied_config_revision = config_revision;
 	ctx->configured_low_c = low_temp_c;
 	ctx->heat_time_base_ms = heat_time_base_ms;
@@ -609,6 +684,19 @@ static void mode4_reset_group(uint32_t group,
 			 APP_CYCLIC_SETPOINT2_C,
 			 heat_time_base_ms,
 			 (unsigned long)config_revision);
+}
+
+static void mode4_return_to_stabilize(uint32_t group) {
+	// 保护条件或配置异常中断当前脉冲时，统一回到低温稳定阶段。
+	// 只在从 HEAT/COOL 真正跨状态返回时清空 PID；若已在 STABILIZE，保留积分项以便 PID 继续正常工作。
+	// 稳定计时的活动标志始终清除：任何传感器失效、欠压或 OTA 扰动后都必须重新完整确认稳定保持期。
+	// 若欠压在阈值附近持续抖动，该计时可能反复清零而无期限地阻止全功率脉冲，这是有意的安全收紧。
+	mode4_group_state_t *ctx = &s_mode4[group];
+	if (ctx->state != MODE4_STABILIZE) {
+		ctx->state = MODE4_STABILIZE;
+		ctrl_pid_reset(&s_pid[group]);
+	}
+	ctx->stable_timer_active = false;
 }
 
 static void mode4_enter_cool(uint32_t group, uint32_t now_ms, float process_temp_c, const char *reason) {
@@ -731,22 +819,14 @@ static float mode4_update_group(uint32_t group,
 	// 欠压或 OTA 不仅要把本周期输出压为零，还要取消正在进行的脉冲计时。
 	// 否则保护解除后可能继续半个旧脉冲，而本轮升温斜率也会被停电时间污染。
 	if (output_inhibited) {
-		if (ctx->state != MODE4_STABILIZE) {
-			ctx->state = MODE4_STABILIZE;
-			ctx->stable_start_ms = 0U;
-			ctrl_pid_reset(&s_pid[group]);
-		}
+		mode4_return_to_stabilize(group);
 		return 0.0f;
 	}
 
 	// 任一温度传感器组失效时立即返回 0ms，并丢弃当前脉冲进度。
 	// 恢复测温后先重新 PID 稳定，不会继续一个时间基准已经失真的剩余脉冲。
 	if (!process_valid || !isfinite(process_temp_c)) {
-		if (ctx->state != MODE4_STABILIZE) {
-			ctx->state = MODE4_STABILIZE;
-			ctx->stable_start_ms = 0U;
-			ctrl_pid_reset(&s_pid[group]);
-		}
+		mode4_return_to_stabilize(group);
 		return 0.0f;
 	}
 
@@ -755,8 +835,7 @@ static float mode4_update_group(uint32_t group,
 		isfinite(low_temp_c) && isfinite(APP_CYCLIC_SETPOINT2_C) &&
 		APP_CYCLIC_SETPOINT2_C > low_temp_c;
 	if (!temperature_range_valid) {
-		ctx->state = MODE4_STABILIZE;
-		ctx->stable_start_ms = 0U;
+		mode4_return_to_stabilize(group);
 		if (!ctx->invalid_range_warned) {
 			ctx->invalid_range_warned = true;
 			ESP_LOGW(TAG,
@@ -769,23 +848,24 @@ static float mode4_update_group(uint32_t group,
 			return 0.0f;
 		}
 		ctrl_pid_set_setpoint(&s_pid[group], low_temp_c);
-		return ctrl_pid_update(&s_pid[group], process_temp_c, dt_s, NULL);
+		return ctrl_pid_update(&s_pid[group], process_temp_c, dt_s);
 	}
 	ctx->invalid_range_warned = false;
 
 	switch (ctx->state) {
 		case MODE4_STABILIZE: {
 			ctrl_pid_set_setpoint(&s_pid[group], low_temp_c);
-			const float pid_output_ms = ctrl_pid_update(&s_pid[group], process_temp_c, dt_s, NULL);
+			const float pid_output_ms = ctrl_pid_update(&s_pid[group], process_temp_c, dt_s);
 			if (fabsf(process_temp_c - low_temp_c) <= APP_CYCLIC_HOLD_THRESHOLD_C) {
-				if (ctx->stable_start_ms == 0U) {
+				if (!ctx->stable_timer_active) {
 					ctx->stable_start_ms = now_ms;
+					ctx->stable_timer_active = true;
 				} else if ((now_ms - ctx->stable_start_ms) >= APP_CYCLIC_HOLD_TIME_MS) {
 					// 进入脉冲前清空 PID 积分和历史误差，后续 HEAT/COOL 阶段完全不调用 PID。
 					ctrl_pid_reset(&s_pid[group]);
 					ctx->state = MODE4_HEAT;
 					ctx->state_enter_ms = now_ms;
-					ctx->stable_start_ms = 0U;
+					ctx->stable_timer_active = false;
 					ctx->heat_start_temp_c = process_temp_c;
 					ctx->heat_end_temp_c = process_temp_c;
 					ctx->peak_temp_c = process_temp_c;
@@ -798,7 +878,7 @@ static float mode4_update_group(uint32_t group,
 				}
 			} else {
 				// 稳定计时必须连续，一旦离开容差带立即清零。
-				ctx->stable_start_ms = 0U;
+				ctx->stable_timer_active = false;
 			}
 			return pid_output_ms;
 		}
@@ -864,6 +944,7 @@ static float mode4_update_group(uint32_t group,
 			return 0.0f;
 	}
 }
+#endif
 
 static void control_task(void *arg) {
 	(void)arg;
@@ -892,9 +973,11 @@ static void control_task(void *arg) {
 
 		// 1) 在极短临界区复制最新传感器快照与控制输入。
 		float requested_sp = APP_DEFAULT_SETPOINT_C;
+#if FEATURE_HEATING_MODE == 4
 		float mode4_heat_time_base_ms = APP_MODE4_HEAT_TIME_DEFAULT_MS;
 		uint32_t mode4_config_revision = 0U;
-#if FEATURE_WIRELESS_ENABLE
+#endif
+#if FEATURE_WIRELESS_ENABLE && FEATURE_HEARTBEAT_FAILSAFE_ENABLE
 		uint32_t last_hb = 0;
 #endif
 		bool ota_pending = false;
@@ -911,34 +994,24 @@ static void control_task(void *arg) {
 		sample.undervoltage = s_state.undervoltage;
 		ota_pending = s_state.ota_pending;
 
-#if FEATURE_WIRELESS_ENABLE
+#if FEATURE_WIRELESS_ENABLE && FEATURE_HEARTBEAT_FAILSAFE_ENABLE
 		last_hb = s_state.last_heartbeat_ms;
 #endif
 		requested_sp = s_state.requested_setpoint_c;
+#if FEATURE_HEATING_MODE == 4
 		mode4_heat_time_base_ms = s_state.mode4_heat_time_base_ms;
 		mode4_config_revision = s_state.mode4_config_revision;
+#endif
 		xSemaphoreGive(s_state_lock);
 
 		// 2) 选择控制温度源并计算当前过程温度。
 		float process_temp[APP_CONTROL_GROUPS] = {NAN, NAN};
 		bool process_valid[APP_CONTROL_GROUPS] = {false, false};
 		for (uint32_t group = 0; group < APP_CONTROL_GROUPS; ++group) {
-			float sum = 0.0f;
-			int count = 0;
-			const uint8_t primary = s_group_map[group].primary_ntc;
-			const uint8_t secondary = s_group_map[group].secondary_ntc;
-			if (sample.ntc_valid[primary]) {
-				sum += sample.ntc_temp_c[primary];
-				count++;
-			}
-			if (sample.ntc_valid[secondary]) {
-				sum += sample.ntc_temp_c[secondary];
-				count++;
-			}
-			if (count > 0) {
-				process_temp[group] = sum / (float)count;
-				process_valid[group] = true;
-			}
+			process_valid[group] = get_group_average_temperature(
+				&sample,
+				group,
+				&process_temp[group]);
 		}
 
 		// 3) 计算每路目标设定值与失联保护后的有效设定值。
@@ -1009,7 +1082,7 @@ static void control_task(void *arg) {
 #else
 			if (process_valid[group]) {
 				ctrl_pid_set_setpoint(&s_pid[group], effective_sp[group]);
-				pwm_on_ms[group] = ctrl_pid_update(&s_pid[group], process_temp[group], dt_s, NULL);
+				pwm_on_ms[group] = ctrl_pid_update(&s_pid[group], process_temp[group], dt_s);
 			}
 #endif
 
@@ -1104,56 +1177,24 @@ static void telemetry_task(void *arg) {
 				 s_failsafe.safe_mode);
 
 #if FEATURE_NTC_CH0_ENABLE || FEATURE_NTC_CH1_ENABLE || FEATURE_NTC_CH2_ENABLE || FEATURE_NTC_CH3_ENABLE
-		// NTC 数据帧：改为上报 PWM 通道的平均反馈温度。
-		float pwm_ch1_avg = 0.0f;
-		bool pwm_ch1_valid = false;
-		float pwm_ch0_avg = 0.0f;
-		bool pwm_ch0_valid = false;
-
-		float sum = 0.0f;
-		int count = 0;
-#if FEATURE_NTC_CH0_ENABLE
-		if (snapshot.ntc_valid[0]) {
-			sum += snapshot.ntc_temp_c[0];
-			count++;
-		}
-#endif
-#if FEATURE_NTC_CH1_ENABLE
-		if (snapshot.ntc_valid[1]) {
-			sum += snapshot.ntc_temp_c[1];
-			count++;
-		}
-#endif
-		if (count > 0) {
-			pwm_ch1_avg = sum / (float)count;
-			pwm_ch1_valid = true;
-		}
-
-		sum = 0.0f;
-		count = 0;
-#if FEATURE_NTC_CH2_ENABLE
-		if (snapshot.ntc_valid[2]) {
-			sum += snapshot.ntc_temp_c[2];
-			count++;
-		}
-#endif
-#if FEATURE_NTC_CH3_ENABLE
-		if (snapshot.ntc_valid[3]) {
-			sum += snapshot.ntc_temp_c[3];
-			count++;
-		}
-#endif
-		if (count > 0) {
-			pwm_ch0_avg = sum / (float)count;
-			pwm_ch0_valid = true;
+		// 先按控制组计算平均温度，再根据映射表存入对应 PWM 下标。
+		// group0 当前映射到 PWM1、group1 映射到 PWM0，显式重排可保持通信协议原有的 PWM0/PWM1 顺序。
+		float pwm_temp_c[APP_CONTROL_GROUPS] = {0.0f, 0.0f};
+		bool pwm_temp_valid[APP_CONTROL_GROUPS] = {false, false};
+		for (uint32_t group = 0; group < APP_CONTROL_GROUPS; ++group) {
+			float group_temp_c = NAN;
+			const bool group_valid = get_group_average_temperature(&snapshot, group, &group_temp_c);
+			const uint8_t pwm_channel = s_group_map[group].pwm_channel;
+			pwm_temp_c[pwm_channel] = group_valid ? group_temp_c : 0.0f;
+			pwm_temp_valid[pwm_channel] = group_valid;
 		}
 
 		uint8_t payload_ntc[8] = {0};
 		const size_t ntc_len = comm_protocol_pack_ntc_payload(
-			pwm_ch0_valid,
-			pwm_ch0_avg,
-			pwm_ch1_valid,
-			pwm_ch1_avg,
+			pwm_temp_valid[0],
+			pwm_temp_c[0],
+			pwm_temp_valid[1],
+			pwm_temp_c[1],
 			payload_ntc,
 			sizeof(payload_ntc));
 		if (ntc_len > 0) {
@@ -1201,22 +1242,21 @@ static void telemetry_task(void *arg) {
 #endif
 
 #if FEATURE_PID_OUT_ENABLE
-		// PID 输出帧（ms）。
-		uint8_t payload_pid[8] = {0};
-		size_t pid_len = comm_protocol_pack_pid_out_payload(
-			snapshot.pwm_on_ms[1], payload_pid, sizeof(payload_pid));
-		if (pid_len == 4) {
-			const size_t pid_len2 = comm_protocol_pack_pid_out_payload(
-				snapshot.pwm_on_ms[0], payload_pid + pid_len, sizeof(payload_pid) - pid_len);
-			if (pid_len2 == 4) {
-				pid_len += pid_len2;
-			} else {
-				pid_len = 0;
-			}
-		} else {
-			pid_len = 0;
+		// s_state.pwm_on_ms[] 以“控制组”为下标，而通信协议要求物理 PWM0 在前、PWM1 在后。
+		// 通过统一映射表显式转换，即使以后调整控制组顺序，遥测帧也不会把两路发反。
+		float pwm_output_ms[2] = {0.0f, 0.0f};
+		for (uint32_t group = 0; group < APP_CONTROL_GROUPS; ++group) {
+			const uint8_t pwm_channel = s_group_map[group].pwm_channel;
+			pwm_output_ms[pwm_channel] = snapshot.pwm_on_ms[group];
 		}
-		if (pid_len > 0) {
+
+		uint8_t payload_pid[8] = {0};
+		const size_t pid_len = comm_protocol_pack_pid_out_payload_2ch(
+			pwm_output_ms[0],
+			pwm_output_ms[1],
+			payload_pid,
+			sizeof(payload_pid));
+		if (pid_len == sizeof(payload_pid)) {
 			telemetry_send(COMM_CMD_PID_OUT, payload_pid, pid_len);
 		}
 #endif
@@ -1234,7 +1274,7 @@ static void udp_command_task(void *arg) {
 
 	while (1) {
 		// 轮询接收 UDP 命令，超时会返回 0。
-		const int len = comm_udp_receive_line(line, sizeof(line), 200);
+		const int len = comm_udp_receive_line(line, sizeof(line));
 		if (len > 0) {
 			comm_command_t cmd = {0};
 			// 解析成功后写入系统状态。

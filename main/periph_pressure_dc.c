@@ -7,7 +7,7 @@ float periph_pressure_dc_voltage_to_kpa(float voltage_v) {
     return (voltage_v - APP_PRESSURE_VOUT_OFFSET_V) / APP_PRESSURE_VOUT_SLOPE_V_PER_KPA;
 }
 
-esp_err_t periph_pressure_dc_read(periph_pressure_dc_sample_t *out_sample) {
+esp_err_t periph_pressure_dc_read_channel(uint8_t adc_cmd, periph_pressure_dc_sample_t *out_sample) {
     if (out_sample == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -18,7 +18,8 @@ esp_err_t periph_pressure_dc_read(periph_pressure_dc_sample_t *out_sample) {
     return ESP_ERR_INVALID_STATE;
 #else
     uint16_t raw12 = 0;
-    const esp_err_t err = periph_adc_read_raw12(APP_PRESSURE_DC_ADC_CMD, &raw12);
+    // ADC 命令由上层的通道配置表传入，因此同一套换算可同时服务 CH1 和 CH2。
+    const esp_err_t err = periph_adc_read_raw12(adc_cmd, &raw12);
     if (err != ESP_OK) {
         return err;
     }

@@ -4,9 +4,6 @@
 
 #include "app_config.h"
 
-// 保存最后一次设置值（ms），便于遥测和调试读取。
-static float s_last_on_time_ms[2] = {0.0f, 0.0f};
-
 #ifndef APP_PWM_PERIOD_MS
 #define APP_PWM_PERIOD_MS 1000.0f
 #endif
@@ -60,9 +57,6 @@ void periph_pwm_set_on_time_ms_ch(uint8_t channel, float on_time_ms) {
     const float duty_percent = (on_time_ms / APP_PWM_PERIOD_MS) * 100.0f;
     pwm_apply_percent_ch(channel, duty_percent);
 
-    if (channel < 2) {
-        s_last_on_time_ms[channel] = on_time_ms;
-    }
 }
 
 void periph_pwm_set_on_time_ms(float on_time_ms) {
@@ -132,32 +126,10 @@ esp_err_t periph_pwm_init(void) {
     return ESP_OK;
 }
 
-void periph_pwm_set_percent(float duty_percent) {
-    if (duty_percent < 0.0f) {
-        duty_percent = 0.0f;
-    }
-    if (duty_percent > 100.0f) {
-        duty_percent = 100.0f;
-    }
-
-    pwm_apply_percent_ch(0, duty_percent);
-    pwm_apply_percent_ch(1, duty_percent);
-    s_last_on_time_ms[0] = (duty_percent / 100.0f) * APP_PWM_PERIOD_MS;
-    s_last_on_time_ms[1] = s_last_on_time_ms[0];
-}
-
 void periph_pwm_force_off_ch(uint8_t channel) {
     periph_pwm_set_on_time_ms_ch(channel, 0.0f);
 }
 
 void periph_pwm_force_off(void) {
     periph_pwm_set_on_time_ms(0.0f);
-}
-
-float periph_pwm_get_on_time_ms(void) {
-    return s_last_on_time_ms[0];
-}
-
-float periph_pwm_get_percent(void) {
-    return (s_last_on_time_ms[0] / APP_PWM_PERIOD_MS) * 100.0f;
 }

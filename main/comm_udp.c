@@ -9,6 +9,7 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
@@ -18,16 +19,53 @@
 // 事件组位定义：用于标记 WiFi 已连网。
 #define WIFI_CONNECTED_BIT  BIT0
 
+#if APP_UDP_RECEIVE_TIMEOUT_MS < 1
+#error "APP_UDP_RECEIVE_TIMEOUT_MS must be >= 1"
+#endif
+
+#if APP_WIFI_RETRY_PERIOD_MS < 1000
+#error "APP_WIFI_RETRY_PERIOD_MS must be >= 1000"
+#endif
+
 static const char *TAG = "comm_udp";
 
 // WiFi 状态相关全局资源。
 static EventGroupHandle_t s_wifi_event_group;
 static int s_retry_num = 0;
 static bool s_wifi_started = false;
+static esp_timer_handle_t s_wifi_retry_timer;
 
 // UDP socket 与远端地址缓存。
 static int s_udp_sock = -1;
 static struct sockaddr_in s_remote_addr;
+
+static void wifi_slow_retry_timer_cb(void *arg) {
+    (void)arg;
+    // 快速重试用尽后，定时器每分钟只发起一次新的连接尝试，避免断网期间高频空转。
+    const esp_err_t err = esp_wifi_connect();
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "wifi slow reconnect attempt");
+    } else {
+        ESP_LOGW(TAG, "wifi slow reconnect start failed: %s", esp_err_to_name(err));
+    }
+}
+
+static void wifi_start_slow_retry(void) {
+    if (s_wifi_retry_timer == NULL) {
+        ESP_LOGE(TAG, "wifi slow retry timer is unavailable");
+        return;
+    }
+
+    // 周期定时器已在运行时 start_periodic 会返回 INVALID_STATE，这只表示无需重复启动。
+    const esp_err_t err = esp_timer_start_periodic(
+        s_wifi_retry_timer,
+        (uint64_t)APP_WIFI_RETRY_PERIOD_MS * 1000ULL);
+    if (err == ESP_OK) {
+        ESP_LOGW(TAG, "wifi fast retries exhausted; retry every %dms", APP_WIFI_RETRY_PERIOD_MS);
+    } else if (err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "wifi slow retry timer start failed: %s", esp_err_to_name(err));
+    }
+}
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
     (void)arg;
@@ -42,11 +80,20 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
             esp_wifi_connect();
             s_retry_num++;
             ESP_LOGW(TAG, "wifi reconnect %d", s_retry_num);
+        } else {
+            wifi_start_slow_retry();
         }
         xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         // 获取 IP 表示链路就绪，设置连接位。
         s_retry_num = 0;
+        if (s_wifi_retry_timer != NULL) {
+            // 已经恢复联网，停止分钟级重试；定时器未运行时返回 INVALID_STATE 可忽略。
+            const esp_err_t stop_err = esp_timer_stop(s_wifi_retry_timer);
+            if (stop_err != ESP_OK && stop_err != ESP_ERR_INVALID_STATE) {
+                ESP_LOGW(TAG, "wifi slow retry timer stop failed: %s", esp_err_to_name(stop_err));
+            }
+        }
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
         ESP_LOGI(TAG, "wifi connected");
     }
@@ -82,6 +129,21 @@ static esp_err_t wifi_start_once(void) {
         s_wifi_event_group = xEventGroupCreate();
         if (s_wifi_event_group == NULL) {
             return ESP_ERR_NO_MEM;
+        }
+    }
+
+    // 慢速重连定时器必须在 WiFi 启动前创建，确保首次连接失败也能进入分钟级恢复机制。
+    if (s_wifi_retry_timer == NULL) {
+        const esp_timer_create_args_t retry_timer_args = {
+            .callback = wifi_slow_retry_timer_cb,
+            .arg = NULL,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "wifi_retry",
+            .skip_unhandled_events = true,
+        };
+        err = esp_timer_create(&retry_timer_args, &s_wifi_retry_timer);
+        if (err != ESP_OK) {
+            return err;
         }
     }
 
@@ -132,6 +194,18 @@ static esp_err_t udp_socket_start_once(void) {
     // 创建 UDP socket。
     s_udp_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
     if (s_udp_sock < 0) {
+        return ESP_FAIL;
+    }
+
+    // 本工程的接收超时是固定配置，在 socket 生命周期内只需设置一次。
+    // 设置失败时关闭刚创建的 socket，避免后续 recvfrom 在无超时状态下无限阻塞。
+    const struct timeval receive_timeout = {
+        .tv_sec = APP_UDP_RECEIVE_TIMEOUT_MS / 1000,
+        .tv_usec = (APP_UDP_RECEIVE_TIMEOUT_MS % 1000) * 1000,
+    };
+    if (setsockopt(s_udp_sock, SOL_SOCKET, SO_RCVTIMEO, &receive_timeout, sizeof(receive_timeout)) < 0) {
+        close(s_udp_sock);
+        s_udp_sock = -1;
         return ESP_FAIL;
     }
 
@@ -190,18 +264,11 @@ esp_err_t comm_udp_send(const uint8_t *data, size_t len) {
     return sent >= 0 ? ESP_OK : ESP_FAIL;
 }
 
-int comm_udp_receive_line(char *out_line, size_t out_len, int timeout_ms) {
+int comm_udp_receive_line(char *out_line, size_t out_len) {
     // 接收缓冲检查。
     if (out_line == NULL || out_len < 2 || s_udp_sock < 0) {
         return -1;
     }
-
-    // 设置接收超时，避免阻塞太久影响任务调度。
-    struct timeval tv = {
-        .tv_sec = timeout_ms / 1000,
-        .tv_usec = (timeout_ms % 1000) * 1000,
-    };
-    setsockopt(s_udp_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     struct sockaddr_in src_addr;
     socklen_t socklen = sizeof(src_addr);

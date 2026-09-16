@@ -136,14 +136,20 @@ size_t comm_protocol_pack_voltage_payload(float voltage_v, bool undervoltage, ui
     return 3;
 }
 
-size_t comm_protocol_pack_pid_out_payload(float pid_out_ms, uint8_t *out_payload, size_t out_cap) {
-    // 固定字段：int32 PID 输出(ms×100)，共 4 字节。
-    if (out_payload == NULL || out_cap < 4) {
+size_t comm_protocol_pack_pid_out_payload_2ch(
+    float pwm_ch0_ms,
+    float pwm_ch1_ms,
+    uint8_t *out_payload,
+    size_t out_cap) {
+    // 载荷固定为两个小端 int32，每路按 ms×100 缩放：前 4 字节是 PWM0，后 4 字节是 PWM1。
+    // 输出缓冲不足时不写入任何字节，调用方可以用返回 0 安全丢弃当前帧。
+    if (out_payload == NULL || out_cap < 8) {
         return 0;
     }
 
-    write_i32_le(&out_payload[0], scale100_to_i32(pid_out_ms));
-    return 4;
+    write_i32_le(&out_payload[0], scale100_to_i32(pwm_ch0_ms));
+    write_i32_le(&out_payload[4], scale100_to_i32(pwm_ch1_ms));
+    return 8;
 }
 
 size_t comm_protocol_pack_dynamic_pressure_payload(uint8_t *payload_buf, uint8_t mask, float ch1_val, float ch2_val) {
@@ -165,15 +171,4 @@ size_t comm_protocol_pack_dynamic_pressure_payload(uint8_t *payload_buf, uint8_t
     }
 
     return offset;
-}
-
-size_t comm_protocol_pack_text_payload(const char *text, uint8_t *out_payload, size_t out_cap) {
-    // 文本按原样拷贝，不做编码转换。
-    if (text == NULL || out_payload == NULL || out_cap == 0) {
-        return 0;
-    }
-
-    const size_t len = strnlen(text, out_cap);
-    memcpy(out_payload, text, len);
-    return len;
 }

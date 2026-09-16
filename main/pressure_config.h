@@ -29,12 +29,4 @@
     #define APP_PRESSURE_SOURCE_DC 0
 #endif
 
-#if APP_PRESSURE_SOURCE_DC
-    #if APP_PRESSURE_DC_CH1
-        #define APP_PRESSURE_DC_ADC_CMD APP_EXT_ADC_CMD_Press1
-    #else
-        #define APP_PRESSURE_DC_ADC_CMD APP_EXT_ADC_CMD_Press2
-    #endif
-#endif
-
 #endif  // PRESSURE_CONFIG_H

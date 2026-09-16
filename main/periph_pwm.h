@@ -20,19 +20,10 @@ void periph_pwm_set_on_time_ms_ch(uint8_t channel, float on_time_ms);
 // 设置 1s 窗口内导通时长（0~1000ms），同时作用于两路通道。
 void periph_pwm_set_on_time_ms(float on_time_ms);
 
-// 设置占空比百分比（0~100）。
-void periph_pwm_set_percent(float duty_percent);
-
 // 强制关闭指定通道输出（占空比置 0）。
 void periph_pwm_force_off_ch(uint8_t channel);
 
 // 强制关闭输出（占空比置 0），作用于两路通道。
 void periph_pwm_force_off(void);
-
-// 获取最近一次设置的导通时长（ms）。
-float periph_pwm_get_on_time_ms(void);
-
-// 获取最近一次设置的占空比百分比。
-float periph_pwm_get_percent(void);
 
 #endif  // PERIPH_PWM_H

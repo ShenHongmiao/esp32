@@ -100,12 +100,9 @@ void ctrl_pid_reset(ctrl_pid_t *pid) {
     pid->output = 0.0f;
 }
 
-float ctrl_pid_update(ctrl_pid_t *pid, float measurement, float dt_s, float *out_error) {
+float ctrl_pid_update(ctrl_pid_t *pid, float measurement, float dt_s) {
     // dt_s 必须为正数，否则微分项会产生除零风险。
     if (pid == NULL || dt_s <= 0.0f) {
-        if (out_error != NULL) {
-            *out_error = 0.0f;
-        }
         return 0.0f;
     }
 
@@ -114,9 +111,6 @@ float ctrl_pid_update(ctrl_pid_t *pid, float measurement, float dt_s, float *out
 
     // 死区内保持当前输出，且不继续积分。
     if (fabsf(error) < APP_PID_DEADBAND_C) {
-        if (out_error != NULL) {
-            *out_error = error;
-        }
         return pid->output;
     }
 
@@ -139,10 +133,6 @@ float ctrl_pid_update(ctrl_pid_t *pid, float measurement, float dt_s, float *out
     pid->output = clamp(pid->output, pid->out_min, pid->out_max);
 
     pid->prev_error = error;
-
-    if (out_error != NULL) {
-        *out_error = error;
-    }
 
     return pid->output;
 }

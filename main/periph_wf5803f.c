@@ -13,6 +13,7 @@
 #define WF5803F_REG_CMD          0x30
 #define WF5803F_CMD_SINGLE_TP    0x0A
 
+#if APP_PRESSURE_SOURCE_WF
 static float wf5803f_pressure_from_raw24(int32_t raw) {
     // 仅保留 24 位有效数据。
     raw &= 0x00FFFFFF;
@@ -31,6 +32,7 @@ static float wf5803f_temp_from_raw16(int16_t raw) {
     // 温度分辨率为 1/256 ℃。
     return (float)raw / 256.0f;
 }
+#endif
 
 esp_err_t periph_wf5803f_read(float *temperature_c, float *pressure_kpa) {
     // 参数检查：两个输出都必须可写。
