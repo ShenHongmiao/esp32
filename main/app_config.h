@@ -11,8 +11,10 @@
  */
 
 // ======================== Feature Switches ========================
-// 加热模式切换开关：1=当前 PID 加热；2=循环 PID 加热（档位 1/2 之间切换）；3=双通道互锁交替循环（相变驱动器，无保持时间，达到高温即刻冷却）。
-#define FEATURE_HEATING_MODE              2
+// 加热模式切换开关：
+// 1=标准 PID 加热；2=循环 PID 加热；3=双通道互锁交替循环；
+// 4=每路独立的“PID 稳定低温点 + 全功率定长脉冲 + 断电冷却”自适应循环。
+#define FEATURE_HEATING_MODE              4
 // 功能总开关：采集与上传使用同一组使能，避免“采了但没发”或“发了无数据”。
 #define FEATURE_NTC_CH0_ENABLE            1 // NTC 通道 0 使能，ADC_CH1，下侧分压测温
 #define FEATURE_NTC_CH1_ENABLE            0 // NTC 通道 1 使能, ADC_CH2
@@ -73,6 +75,28 @@
 #define APP_CYCLIC_HOLD_TIME_MS           1000
 // 模式 3 双通道互锁循环：冷却通道温度降至该阈值以下即刻触发另一路加热。
 #define APP_MODE3_TRIG_TEMP_C             35.0f
+
+// ======================== Heating Mode 4 ========================
+// 模式 4 的所有参数集中放置在此处，避免与通用 PID 参数或其他模式参数混杂。
+// 基准加热时长仅存于 RAM：每次上电都从 200ms 开始重新学习，不写入 NVS。
+#define APP_MODE4_HEAT_TIME_DEFAULT_MS    200.0f
+// 工作加热时长的硬上下限；下限等于一个 20ms 控制周期。
+#define APP_MODE4_HEAT_TIME_MIN_MS        20.0f
+#define APP_MODE4_HEAT_TIME_MAX_MS        1000.0f
+// 自适应开关：1 根据实测峰值修正脉冲宽度，0 始终使用基准时长。
+#define APP_MODE4_ADAPT_ENABLE            1
+// 单次修正量不得超过当前工作时长的 30%，防止一次异常测量导致大幅跳变。
+#define APP_MODE4_ADAPT_MAX_STEP_RATIO    0.30f
+// 峰值进入目标温度±1℃即视为收敛；不得小于单周期约 1℃ 的温升分辨率。
+#define APP_MODE4_PEAK_TOL_C              1.0f
+// 加热期温度超过高温点 3℃ 时立即转入冷却，该判定每个控制周期执行。
+#define APP_MODE4_OVERTEMP_TRIP_C         3.0f
+// 加热安全超时是当前工作时长的倍数，禁止使用固定的秒级超时。
+#define APP_MODE4_HEAT_TIMEOUT_FACTOR     2.0f
+// 冷却到低温点以下 0.5℃ 才允许下一次脉冲，避免阈值附近抖动。
+#define APP_MODE4_LOW_HYST_C              0.5f
+// 全功率关断后仍有热惯性上冲，因此在冷却段前 500ms 持续捕获最高温度。
+#define APP_MODE4_PEAK_TRACK_MS           500U
 
 // ======================== I2C and Peripheral Pins ================
 // I2C 总线定义：对应硬件图纸 IO11/IO12，速率 400kHz。

@@ -195,7 +195,7 @@ NTC 电压以 2ms 周期高速采样，而非 NTC 外设（电源电压检测、
 
 | 宏定义 | 默认值 | 说明 |
 | --- | --- | --- |
-| `FEATURE_HEATING_MODE` | 2 | 加热模式：1=标准 PID 加热；2=循环 PID 加热（档位 1/2 自动切换）；3=双通道互锁交替循环（相变驱动器，无保持时间） |
+| `FEATURE_HEATING_MODE` | 4 | 加热模式：1=标准 PID；2=循环 PID；3=双通道互锁交替；4=PID 稳定+全功率定长脉冲自适应循环 |
 | `FEATURE_NTC_CH0_ENABLE` | 1 | NTC 通道 0 使能（ADC CH1，对应控制组 0 主通道） |
 | `FEATURE_NTC_CH1_ENABLE` | 0 | NTC 通道 1 使能（ADC CH2，对应控制组 0 备通道） |
 | `FEATURE_NTC_CH2_ENABLE` | 0 | NTC 通道 2 使能（ADC CH3，对应控制组 1 主通道） |
@@ -258,12 +258,12 @@ NTC 电压以 2ms 周期高速采样，而非 NTC 外设（电源电压检测、
 
 ### 4.4 加热模式参数
 
-三种加热模式通过 `FEATURE_HEATING_MODE` 宏在编译期互斥选择（彼此完全独立，无嵌套）。
+四种加热模式通过 `FEATURE_HEATING_MODE` 宏在编译期互斥选择（彼此完全独立，无嵌套）。
 
 | 宏定义 | 默认值 | 说明 |
 | --- | --- | --- |
-| `APP_DEFAULT_SETPOINT_C` | 50.0 | 初始目标温度 / 模式 2 档位 1 温度 / 模式 3 低温点 T_low（℃） |
-| `APP_CYCLIC_SETPOINT2_C` | 60.0 | 模式 2 档位 2 温度 / 模式 3 高温点 T_high（℃） |
+| `APP_DEFAULT_SETPOINT_C` | 50.0 | 初始目标温度 / 模式 2 档位 1 / 模式 3、4 低温点 T_low（℃） |
+| `APP_CYCLIC_SETPOINT2_C` | 60.0 | 模式 2 档位 2 / 模式 3、4 高温点 T_high（℃） |
 | `APP_CYCLIC_HOLD_THRESHOLD_C` | 0.5 | 到达判定阈值（℃）：过程温度进入目标温度 ± 该阈值视为"已到达" |
 | `APP_CYCLIC_HOLD_TIME_MS` | 1000 | 保持时间（ms）：仅模式 2 使用，稳定在目标范围内持续该时间后切换档位 |
 | `APP_MODE3_TRIG_TEMP_C` | 35.0 | 模式 3 专有：降温触发阈值（℃），冷却通道温度降至该值以下即刻触发另一路加热 |
@@ -360,8 +360,32 @@ t=16s: CH1 降至 35.0℃ → 回到 MODE3_CH0_HEAT
 - **无保持时间**：到达高温后**不等待**，立即跳转。这一点与模式 2 根本不同。
 - **PID 目标值突变**：模式 3 每次状态切换时两路设定值会突变（如 T_high→T_low），PID 复位逻辑（`s_last_target_sp` 变化自动 `ctrl_pid_reset`）对模式 3 同样生效，避免积分冲击。
 - **传感器失效保护**：若某通道温度无效（`valid=false`），该通道对应的跳转条件不会触发，状态机停在当前状态，该通道 PWM 被关断（由 `control_task` 通用逻辑保证）。
-- **编译期互斥**：通过 `#if FEATURE_HEATING_MODE == 2` / `#elif FEATURE_HEATING_MODE == 3` 实现，模式 2 和模式 3 的代码完全不重叠，只共用宏定义。
+- **编译期互斥**：通过 `FEATURE_HEATING_MODE` 的编译分支选择模式 1~4，各模式的输出策略相互独立。
 - **上电初始状态**：`s_mode3_state = MODE3_CH0_HEAT`，即 CH0 先加热，CH1 等待。
+
+#### 4.4.3 模式 4：PID 稳定 + 全功率定长脉冲
+
+当 `FEATURE_HEATING_MODE = 4` 时启用。两个控制组各自运行 `MODE4_STABILIZE -> MODE4_HEAT -> MODE4_COOL` 三态状态机，彼此不互锁：
+
+- `MODE4_STABILIZE`：仅此阶段运行 PID，将温度稳定在运行期 `SP`/`SETPOINT` 指定的 T_low。进入±0.5℃并连续保持 1000ms 后清空 PID 历史项并开始脉冲。
+- `MODE4_HEAT`：持续输出 1000ms（对应 100% PWM），时长由当前 `heat_time_ms` 决定。温度不参与普通控制，只用于记录峰值和执行 T_high+3℃ 过温跳闸。
+- `MODE4_COOL`：强制输出 0ms，关断后前 500ms 继续记录热惯性峰值。温度降到 `T_low - 0.5℃` 后，根据上一轮峰值修正脉冲宽度并开始下一轮。
+
+自适应修正以 20ms 控制周期为量化步长，单次最大改变不超过当前时长的 30%，工作范围为 20~1000ms。峰值进入 T_high±1℃后标记为收敛并停止调整。T_low 不小于 T_high 时禁止脉冲，仅保留低温 PID 并输出告警。
+
+| 模式 4 宏 | 默认值 | 说明 |
+| --- | --- | --- |
+| `APP_MODE4_HEAT_TIME_DEFAULT_MS` | 200.0 | 上电基准脉冲时长（ms） |
+| `APP_MODE4_HEAT_TIME_MIN_MS` / `MAX_MS` | 20.0 / 1000.0 | 自适应时长边界 |
+| `APP_MODE4_ADAPT_ENABLE` | 1 | 自适应修正开关 |
+| `APP_MODE4_ADAPT_MAX_STEP_RATIO` | 0.30 | 单次修正比例上限 |
+| `APP_MODE4_PEAK_TOL_C` | 1.0 | 峰值收敛容差（℃） |
+| `APP_MODE4_OVERTEMP_TRIP_C` | 3.0 | 相对 T_high 的过温跳闸余量（℃） |
+| `APP_MODE4_HEAT_TIMEOUT_FACTOR` | 2.0 | 相对当前脉冲宽度的超时倍数 |
+| `APP_MODE4_LOW_HYST_C` | 0.5 | 冷却到低温点下方的触发迟滞（℃） |
+| `APP_MODE4_PEAK_TRACK_MS` | 500 | 断电后峰值跟踪窗口（ms） |
+
+本实现选择纯 RAM 方案，不向 NVS 写入学习结果。每次上电都从 `APP_MODE4_HEAT_TIME_DEFAULT_MS` 重新学习；`SP`/`SETPOINT` 或 `HTIME` 命令也会将两路工作值恢复为当前基准值并返回稳定阶段。
 
 ### 4.5 引脚与总线定义
 
@@ -743,10 +767,11 @@ LEDC duty = (占空比 / 100) × 1023
 | `KI=xx` | — | PID 积分增益 | 浮点数 | 同步修改两路 PID 的 Ki 参数（修改时清积分项） |
 | `KD=xx` | — | PID 微分增益 | 浮点数 | 同步修改两路 PID 的 Kd 参数 |
 | `ILIMIT=xx` | `INTEGRAL_LIMIT=xx` | 积分限幅 | 浮点数（%） | 同步修改两路 PID 的积分限幅 |
+| `HTIME=xx` | — | 模式 4 基准加热时长 | 20~1000ms | 修改 RAM 基准值，两路工作值复位后重新稳定 |
 
 **注意事项**：
 - 任何合法命令（包括心跳）都更新最后心跳时间戳 `last_heartbeat_ms`
-- SETPOINT/KP/KI/KD/ILIMIT 命令对两路 PID 同步生效（无法单独控制一路）
+- SETPOINT/KP/KI/KD/ILIMIT/HTIME 命令对两路控制组同步生效（无法单独控制一路）
 - KI 参数修改时，两路 PID 的积分项同时清零
 - 命令解析失败（未知命令）时静默忽略，不影响系统运行
 

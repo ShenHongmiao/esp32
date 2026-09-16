@@ -60,6 +60,10 @@ typedef struct {
 	float requested_setpoint_c;
 	float effective_setpoint_c[2];
 	float pwm_on_ms[2];
+	// 模式 4 的基准加热时长仅保存在 RAM，上电时总是恢复宏默认值。
+	float mode4_heat_time_base_ms;
+	// SP/HTIME 命令每到达一次都递增版本号，即使新值与旧值相同也能触发状态机复位。
+	uint32_t mode4_config_revision;
 
     // 上位机心跳时间戳与 OTA 请求标志。
 	uint32_t last_heartbeat_ms;
@@ -116,11 +120,49 @@ typedef enum {
 } mode3_state_t;
 static mode3_state_t s_mode3_state = MODE3_CH0_HEAT;
 
+// 模式 4 每个控制组都使用一套完全独立的三态状态机，两路之间不互锁。
+typedef enum {
+	MODE4_STABILIZE = 0, // 用 PID 将过程温度稳定在 T_low。
+	MODE4_HEAT,          // 输出 1000ms（即 100% 占空比）的定长脉冲。
+	MODE4_COOL,          // 强制输出 0ms，捕获热惯性峰值并等待降温。
+} mode4_state_id_t;
+
+typedef struct {
+	mode4_state_id_t state;
+	uint32_t state_enter_ms;
+	uint32_t stable_start_ms;
+	uint32_t applied_config_revision;
+	float configured_low_c;
+	float heat_time_base_ms;
+	float heat_time_ms;
+	float heat_start_temp_c;
+	float heat_end_temp_c;
+	float peak_temp_c;
+	bool converged;
+	bool invalid_range_warned;
+	bool saturation_warned;
+} mode4_group_state_t;
+
+static mode4_group_state_t s_mode4[APP_CONTROL_GROUPS];
+
+#if FEATURE_HEATING_MODE == 4
+// 将需求文档中与 20ms 控制分辨率直接相关的硬约束变成编译期检查，
+// 防止日后调参时将峰值容差设得过小，导致脉冲在相邻周期之间往复振荡。
+_Static_assert(APP_CONTROL_PERIOD_MS > 0, "mode4 requires a positive control period");
+_Static_assert(APP_MODE4_PEAK_TOL_C >= 1.0f, "APP_MODE4_PEAK_TOL_C must be >= 1.0C");
+_Static_assert(APP_MODE4_HEAT_TIME_MIN_MS > 0.0f,
+			   "APP_MODE4_HEAT_TIME_MIN_MS must be positive");
+_Static_assert(APP_MODE4_HEAT_TIME_DEFAULT_MS >= APP_MODE4_HEAT_TIME_MIN_MS &&
+			   APP_MODE4_HEAT_TIME_DEFAULT_MS <= APP_MODE4_HEAT_TIME_MAX_MS,
+			   "mode4 default heat time must be inside min/max bounds");
+_Static_assert(APP_MODE4_HEAT_TIMEOUT_FACTOR >= 1.0f,
+			   "mode4 timeout factor must not be shorter than the requested pulse");
+#endif
+
 static uint32_t app_now_ms(void) {
 	// 统一使用 esp_timer 提供的微秒计时，再转换为毫秒。
 	return (uint32_t)(esp_timer_get_time() / 1000ULL);
 }
-
 static esp_err_t init_nvs(void) {
 	// NVS 初始化失败且提示页满/版本不一致时，先擦除再重建。
 	esp_err_t err = nvs_flash_init();
@@ -141,6 +183,8 @@ static void runtime_init(void) {
 		s_last_target_sp[group] = APP_DEFAULT_SETPOINT_C;
 	}
 	s_state.last_heartbeat_ms = app_now_ms();
+	s_state.mode4_heat_time_base_ms = APP_MODE4_HEAT_TIME_DEFAULT_MS;
+	s_state.mode4_config_revision = 0U;
 	s_state.dc_pressure_kpa_ch1 = 0.0f;
 	s_state.dc_pressure_kpa_ch2 = 0.0f;
 	s_state.pressure_mask = 0;
@@ -402,6 +446,9 @@ static void apply_command(const comm_command_t *cmd) {
 			break;
 		case COMM_COMMAND_SETPOINT:
 			s_state.requested_setpoint_c = cmd->value;
+			// 模式 4 规定：收到温度命令就必须丢弃已学习的工作时长并重新稳定。
+			// 使用事件版本号而不是仅比较浮点值，以便 SP=50 连续发送两次也能复位。
+			s_state.mode4_config_revision++;
 			break;
 		case COMM_COMMAND_KP:
 			for (uint32_t group = 0; group < APP_CONTROL_GROUPS; ++group) {
@@ -426,6 +473,22 @@ static void apply_command(const comm_command_t *cmd) {
 				ctrl_pid_set_integral_limit(&s_pid[group], cmd->value);
 			}
 			break;
+		case COMM_COMMAND_HTIME:
+			// HTIME 是基准时长而不是当前学习值。拒绝 NaN/无穷大及越界值，
+			// 避免非法时长绕过状态机的 20~1000ms 安全边界。
+			if (isfinite(cmd->value) &&
+				cmd->value >= APP_MODE4_HEAT_TIME_MIN_MS &&
+				cmd->value <= APP_MODE4_HEAT_TIME_MAX_MS) {
+				s_state.mode4_heat_time_base_ms = cmd->value;
+				s_state.mode4_config_revision++;
+			} else {
+				ESP_LOGW(TAG,
+						 "reject HTIME=%.3fms, valid range is %.1f..%.1fms",
+						 cmd->value,
+						 APP_MODE4_HEAT_TIME_MIN_MS,
+						 APP_MODE4_HEAT_TIME_MAX_MS);
+			}
+			break;
 		case COMM_COMMAND_OTA:
 			s_state.ota_pending = true;
 			break;
@@ -440,15 +503,17 @@ static void apply_command(const comm_command_t *cmd) {
 	const float kp1 = s_pid[1].kp;
 	const float ki1 = s_pid[1].ki;
 	const float kd1 = s_pid[1].kd;
+	const float mode4_base_ms = s_state.mode4_heat_time_base_ms;
 
 	xSemaphoreGive(s_state_lock);
 
 	// 打印命令和当前关键参数，便于联调追踪。
 	ESP_LOGI(TAG,
-			 "cmd=%d value=%.3f sp=%.2f kp0=%.2f ki0=%.2f kd0=%.2f kp1=%.2f ki1=%.2f kd1=%.2f",
+			 "cmd=%d value=%.3f sp=%.2f mode4_base=%.1fms kp0=%.2f ki0=%.2f kd0=%.2f kp1=%.2f ki1=%.2f kd1=%.2f",
 			 cmd->type,
 			 cmd->value,
 			 sp,
+			 mode4_base_ms,
 			 kp0,
 			 ki0,
 			 kd0,
@@ -504,6 +569,302 @@ static void update_mode3_setpoints(float proc_temp_ch0, bool valid_ch0,
     }
 }
 
+static float mode4_clampf(float value, float min_value, float max_value) {
+	// 模式 4 内部使用的通用限幅，保证时长和单次修正量始终处于安全范围。
+	if (value < min_value) {
+		return min_value;
+	}
+	if (value > max_value) {
+		return max_value;
+	}
+	return value;
+}
+
+static void mode4_reset_group(uint32_t group,
+							  float low_temp_c,
+							  float heat_time_base_ms,
+							  uint32_t config_revision) {
+	// SP/HTIME 变更后必须同时复位状态机、PID 历史项和自适应学习结果。
+	// 基准值和工作值在此刻相同，之后只有自适应算法可以修改工作值。
+	mode4_group_state_t *ctx = &s_mode4[group];
+	ctx->state = MODE4_STABILIZE;
+	ctx->state_enter_ms = app_now_ms();
+	ctx->stable_start_ms = 0U;
+	ctx->applied_config_revision = config_revision;
+	ctx->configured_low_c = low_temp_c;
+	ctx->heat_time_base_ms = heat_time_base_ms;
+	ctx->heat_time_ms = heat_time_base_ms;
+	ctx->heat_start_temp_c = NAN;
+	ctx->heat_end_temp_c = NAN;
+	ctx->peak_temp_c = NAN;
+	ctx->converged = false;
+	ctx->invalid_range_warned = false;
+	ctx->saturation_warned = false;
+	ctrl_pid_reset(&s_pid[group]);
+
+	ESP_LOGI(TAG,
+			 "mode4 group%lu reset: T_low=%.2fC T_high=%.2fC base=%.1fms revision=%lu",
+			 (unsigned long)group,
+			 low_temp_c,
+			 APP_CYCLIC_SETPOINT2_C,
+			 heat_time_base_ms,
+			 (unsigned long)config_revision);
+}
+
+static void mode4_enter_cool(uint32_t group, uint32_t now_ms, float process_temp_c, const char *reason) {
+	// 记录脉冲末端温度供升温斜率计算，并从当前温度开始追踪断电后的惯性峰值。
+	mode4_group_state_t *ctx = &s_mode4[group];
+	ctx->state = MODE4_COOL;
+	ctx->state_enter_ms = now_ms;
+	ctx->heat_end_temp_c = process_temp_c;
+	if (!isfinite(ctx->peak_temp_c) || process_temp_c > ctx->peak_temp_c) {
+		ctx->peak_temp_c = process_temp_c;
+	}
+
+	ESP_LOGI(TAG,
+			 "mode4 group%lu HEAT->COOL (%s): start=%.2fC end=%.2fC peak=%.2fC pulse=%.1fms",
+			 (unsigned long)group,
+			 reason,
+			 ctx->heat_start_temp_c,
+			 ctx->heat_end_temp_c,
+			 ctx->peak_temp_c,
+			 ctx->heat_time_ms);
+}
+
+static void mode4_adapt_heat_time(uint32_t group) {
+	mode4_group_state_t *ctx = &s_mode4[group];
+	const float peak_error_c = APP_CYCLIC_SETPOINT2_C - ctx->peak_temp_c;
+
+	// 峰值进入容差带后将本组标记为已收敛，直到 SP/HTIME 命令复位前不再改变脉冲宽度。
+	if (isfinite(ctx->peak_temp_c) && fabsf(peak_error_c) <= APP_MODE4_PEAK_TOL_C) {
+		ctx->converged = true;
+		ESP_LOGI(TAG,
+				 "mode4 group%lu converged: peak=%.2fC target=%.2fC heat_time=%.1fms",
+				 (unsigned long)group,
+				 ctx->peak_temp_c,
+				 APP_CYCLIC_SETPOINT2_C,
+				 ctx->heat_time_ms);
+		return;
+	}
+
+#if APP_MODE4_ADAPT_ENABLE
+	if (ctx->converged || !isfinite(ctx->heat_start_temp_c) ||
+		!isfinite(ctx->heat_end_temp_c) || !isfinite(ctx->peak_temp_c)) {
+		return;
+	}
+
+	// 严格按需求用“脉冲末温度-脉冲起始温度”除以当前工作时长得到实测斜率。
+	// 斜率为零或负值意味着测量或加热链路异常，此时不可用牛顿步长进行除法。
+	const float slope_c_per_ms =
+		(ctx->heat_end_temp_c - ctx->heat_start_temp_c) / ctx->heat_time_ms;
+	if (!isfinite(slope_c_per_ms) || slope_c_per_ms <= 0.000001f) {
+		ESP_LOGW(TAG,
+				 "mode4 group%lu cannot adapt: invalid heating slope %.6fC/ms",
+				 (unsigned long)group,
+				 slope_c_per_ms);
+		return;
+	}
+
+	const float quantum_ms = (float)APP_CONTROL_PERIOD_MS;
+	float delta_ms = peak_error_c / slope_c_per_ms;
+	// 脉冲只能按控制周期落地，因此先四舍五入到 20ms 的整数倍。
+	delta_ms = roundf(delta_ms / quantum_ms) * quantum_ms;
+	if (fabsf(delta_ms) < quantum_ms) {
+		return;
+	}
+
+	// 将 30% 步长上限向下量化到完整控制周期，避免限幅后反而产生非 20ms 整数倍。
+	const float max_step_ms =
+		floorf((ctx->heat_time_ms * APP_MODE4_ADAPT_MAX_STEP_RATIO) / quantum_ms) * quantum_ms;
+	if (max_step_ms < quantum_ms) {
+		return;
+	}
+	delta_ms = mode4_clampf(delta_ms, -max_step_ms, max_step_ms);
+
+	const float old_heat_time_ms = ctx->heat_time_ms;
+	ctx->heat_time_ms = mode4_clampf(
+		ctx->heat_time_ms + delta_ms,
+		APP_MODE4_HEAT_TIME_MIN_MS,
+		APP_MODE4_HEAT_TIME_MAX_MS);
+
+	ESP_LOGI(TAG,
+			 "mode4 group%lu adapt: peak=%.2fC slope=%.5fC/ms delta=%.1fms heat_time %.1f->%.1fms",
+			 (unsigned long)group,
+			 ctx->peak_temp_c,
+			 slope_c_per_ms,
+			 delta_ms,
+			 old_heat_time_ms,
+			 ctx->heat_time_ms);
+
+	if (ctx->heat_time_ms >= APP_MODE4_HEAT_TIME_MAX_MS &&
+		ctx->peak_temp_c < (APP_CYCLIC_SETPOINT2_C - APP_MODE4_PEAK_TOL_C) &&
+		!ctx->saturation_warned) {
+		ctx->saturation_warned = true;
+		ESP_LOGW(TAG,
+				 "mode4 group%lu heat time saturated at %.1fms but peak %.2fC is below target %.2fC",
+				 (unsigned long)group,
+				 ctx->heat_time_ms,
+				 ctx->peak_temp_c,
+				 APP_CYCLIC_SETPOINT2_C);
+	}
+#endif
+}
+
+static float mode4_update_group(uint32_t group,
+							float process_temp_c,
+							bool process_valid,
+							bool output_inhibited,
+							float low_temp_c,
+							float heat_time_base_ms,
+							uint32_t config_revision,
+							float dt_s) {
+	mode4_group_state_t *ctx = &s_mode4[group];
+	const uint32_t now_ms = app_now_ms();
+
+	// 配置命令是强制复位事件；此外，心跳保护若改变了有效低温点，也必须从稳定阶段重新开始。
+	if (ctx->applied_config_revision != config_revision ||
+		ctx->configured_low_c != low_temp_c ||
+		ctx->heat_time_base_ms != heat_time_base_ms) {
+		mode4_reset_group(group, low_temp_c, heat_time_base_ms, config_revision);
+	}
+
+	// 欠压或 OTA 不仅要把本周期输出压为零，还要取消正在进行的脉冲计时。
+	// 否则保护解除后可能继续半个旧脉冲，而本轮升温斜率也会被停电时间污染。
+	if (output_inhibited) {
+		if (ctx->state != MODE4_STABILIZE) {
+			ctx->state = MODE4_STABILIZE;
+			ctx->stable_start_ms = 0U;
+			ctrl_pid_reset(&s_pid[group]);
+		}
+		return 0.0f;
+	}
+
+	// 任一温度传感器组失效时立即返回 0ms，并丢弃当前脉冲进度。
+	// 恢复测温后先重新 PID 稳定，不会继续一个时间基准已经失真的剩余脉冲。
+	if (!process_valid || !isfinite(process_temp_c)) {
+		if (ctx->state != MODE4_STABILIZE) {
+			ctx->state = MODE4_STABILIZE;
+			ctx->stable_start_ms = 0U;
+			ctrl_pid_reset(&s_pid[group]);
+		}
+		return 0.0f;
+	}
+
+	// T_high 必须严格大于 T_low。不合法时只保留低温 PID，禁止进入全功率脉冲。
+	const bool temperature_range_valid =
+		isfinite(low_temp_c) && isfinite(APP_CYCLIC_SETPOINT2_C) &&
+		APP_CYCLIC_SETPOINT2_C > low_temp_c;
+	if (!temperature_range_valid) {
+		ctx->state = MODE4_STABILIZE;
+		ctx->stable_start_ms = 0U;
+		if (!ctx->invalid_range_warned) {
+			ctx->invalid_range_warned = true;
+			ESP_LOGW(TAG,
+					 "mode4 group%lu disabled: T_high %.2fC must be greater than T_low %.2fC; PID-only fallback",
+					 (unsigned long)group,
+					 APP_CYCLIC_SETPOINT2_C,
+					 low_temp_c);
+		}
+		if (!isfinite(low_temp_c)) {
+			return 0.0f;
+		}
+		ctrl_pid_set_setpoint(&s_pid[group], low_temp_c);
+		return ctrl_pid_update(&s_pid[group], process_temp_c, dt_s, NULL);
+	}
+	ctx->invalid_range_warned = false;
+
+	switch (ctx->state) {
+		case MODE4_STABILIZE: {
+			ctrl_pid_set_setpoint(&s_pid[group], low_temp_c);
+			const float pid_output_ms = ctrl_pid_update(&s_pid[group], process_temp_c, dt_s, NULL);
+			if (fabsf(process_temp_c - low_temp_c) <= APP_CYCLIC_HOLD_THRESHOLD_C) {
+				if (ctx->stable_start_ms == 0U) {
+					ctx->stable_start_ms = now_ms;
+				} else if ((now_ms - ctx->stable_start_ms) >= APP_CYCLIC_HOLD_TIME_MS) {
+					// 进入脉冲前清空 PID 积分和历史误差，后续 HEAT/COOL 阶段完全不调用 PID。
+					ctrl_pid_reset(&s_pid[group]);
+					ctx->state = MODE4_HEAT;
+					ctx->state_enter_ms = now_ms;
+					ctx->stable_start_ms = 0U;
+					ctx->heat_start_temp_c = process_temp_c;
+					ctx->heat_end_temp_c = process_temp_c;
+					ctx->peak_temp_c = process_temp_c;
+					ESP_LOGI(TAG,
+							 "mode4 group%lu STABILIZE->HEAT: temp=%.2fC pulse=%.1fms",
+							 (unsigned long)group,
+							 process_temp_c,
+							 ctx->heat_time_ms);
+					return APP_PWM_PERIOD_MS;
+				}
+			} else {
+				// 稳定计时必须连续，一旦离开容差带立即清零。
+				ctx->stable_start_ms = 0U;
+			}
+			return pid_output_ms;
+		}
+
+		case MODE4_HEAT: {
+			if (process_temp_c > ctx->peak_temp_c) {
+				ctx->peak_temp_c = process_temp_c;
+			}
+			const uint32_t elapsed_ms = now_ms - ctx->state_enter_ms;
+			if (process_temp_c >= (APP_CYCLIC_SETPOINT2_C + APP_MODE4_OVERTEMP_TRIP_C)) {
+				mode4_enter_cool(group, now_ms, process_temp_c, "over-temperature trip");
+				return 0.0f;
+			}
+
+			// 先检查相对超时：若任务调度异常使一次循环跨过两个边界，日志中仍能明确标记为安全超时。
+			const float timeout_ms = ctx->heat_time_ms * APP_MODE4_HEAT_TIMEOUT_FACTOR;
+			if ((float)elapsed_ms >= timeout_ms) {
+				ESP_LOGW(TAG,
+						 "mode4 group%lu heat timeout: elapsed=%lums limit=%.1fms",
+						 (unsigned long)group,
+						 (unsigned long)elapsed_ms,
+						 timeout_ms);
+				mode4_enter_cool(group, now_ms, process_temp_c, "relative timeout");
+				return 0.0f;
+			}
+			if ((float)elapsed_ms >= ctx->heat_time_ms) {
+				mode4_enter_cool(group, now_ms, process_temp_c, "pulse complete");
+				return 0.0f;
+			}
+			return APP_PWM_PERIOD_MS;
+		}
+
+		case MODE4_COOL: {
+			const uint32_t cool_elapsed_ms = now_ms - ctx->state_enter_ms;
+			// 只在断电后前 500ms 更新峰值，超过窗口后冻结结果，避免冷却期噪声改写本轮峰值。
+			if (cool_elapsed_ms <= APP_MODE4_PEAK_TRACK_MS && process_temp_c > ctx->peak_temp_c) {
+				ctx->peak_temp_c = process_temp_c;
+			}
+
+			// 至少完整观测 500ms 热惯性窗口后才允许开始下一轮。
+			// 这样即使小热容负载在 500ms 内已降到低温阈值，峰值也不会被提前截断。
+			if (cool_elapsed_ms >= APP_MODE4_PEAK_TRACK_MS &&
+				process_temp_c <= (low_temp_c - APP_MODE4_LOW_HYST_C)) {
+				mode4_adapt_heat_time(group);
+				ctx->state = MODE4_HEAT;
+				ctx->state_enter_ms = now_ms;
+				ctx->heat_start_temp_c = process_temp_c;
+				ctx->heat_end_temp_c = process_temp_c;
+				ctx->peak_temp_c = process_temp_c;
+				ESP_LOGI(TAG,
+						 "mode4 group%lu COOL->HEAT: temp=%.2fC next_pulse=%.1fms converged=%d",
+						 (unsigned long)group,
+						 process_temp_c,
+						 ctx->heat_time_ms,
+						 ctx->converged);
+				return APP_PWM_PERIOD_MS;
+			}
+			return 0.0f;
+		}
+
+		default:
+			mode4_reset_group(group, low_temp_c, heat_time_base_ms, config_revision);
+			return 0.0f;
+	}
+}
+
 static void control_task(void *arg) {
 	(void)arg;
 	// 离散 PID 的采样周期（秒）。
@@ -531,6 +892,8 @@ static void control_task(void *arg) {
 
 		// 1) 在极短临界区复制最新传感器快照与控制输入。
 		float requested_sp = APP_DEFAULT_SETPOINT_C;
+		float mode4_heat_time_base_ms = APP_MODE4_HEAT_TIME_DEFAULT_MS;
+		uint32_t mode4_config_revision = 0U;
 #if FEATURE_WIRELESS_ENABLE
 		uint32_t last_hb = 0;
 #endif
@@ -552,6 +915,8 @@ static void control_task(void *arg) {
 		last_hb = s_state.last_heartbeat_ms;
 #endif
 		requested_sp = s_state.requested_setpoint_c;
+		mode4_heat_time_base_ms = s_state.mode4_heat_time_base_ms;
+		mode4_config_revision = s_state.mode4_config_revision;
 		xSemaphoreGive(s_state_lock);
 
 		// 2) 选择控制温度源并计算当前过程温度。
@@ -626,18 +991,31 @@ static void control_task(void *arg) {
 		}
 #endif
 
-		// 4) 温度有效时执行 PID；无效通道仅关断对应 PWM。
+		// 4) 模式 1~3 使用通用 PID 输出；模式 4 由三态状态机决定 PID/100%/0% 输出。
+		// 两条路径最后都经过欠压和 OTA 硬关断，传感器无效时也不会向 PWM 驱动下发非零值。
 		float pwm_on_ms[APP_CONTROL_GROUPS] = {0.0f, 0.0f};
 		xSemaphoreTake(s_state_lock, portMAX_DELAY);
 		for (uint32_t group = 0; group < APP_CONTROL_GROUPS; ++group) {
+#if FEATURE_HEATING_MODE == 4
+			pwm_on_ms[group] = mode4_update_group(
+				group,
+				process_temp[group],
+				process_valid[group],
+				sample.undervoltage || ota_pending,
+				effective_sp[group],
+				mode4_heat_time_base_ms,
+				mode4_config_revision,
+				dt_s);
+#else
 			if (process_valid[group]) {
 				ctrl_pid_set_setpoint(&s_pid[group], effective_sp[group]);
 				pwm_on_ms[group] = ctrl_pid_update(&s_pid[group], process_temp[group], dt_s, NULL);
+			}
+#endif
 
-				// 欠压或 OTA 挂起期间，强制输出为 0。
-				if (sample.undervoltage || ota_pending) {
-					pwm_on_ms[group] = 0.0f;
-				}
+			// 欠压或 OTA 挂起期间无条件覆盖为 0，模式 4 的全功率脉冲也不例外。
+			if (sample.undervoltage || ota_pending) {
+				pwm_on_ms[group] = 0.0f;
 			}
 
 			s_state.process_temp_c[group] = process_temp[group];
@@ -990,4 +1368,3 @@ void app_main(void) {
 	// OTA 任务，归入 other 核心。
 	xTaskCreatePinnedToCore(ota_task, "ota_task", 6144, NULL, 4, NULL, core_comm);
 }
-                                                 

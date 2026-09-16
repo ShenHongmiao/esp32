@@ -17,6 +17,7 @@ typedef enum {
     COMM_COMMAND_KI,
     COMM_COMMAND_KD,
     COMM_COMMAND_ILIMIT,
+    COMM_COMMAND_HTIME,
     COMM_COMMAND_OTA,
 } comm_command_type_t;
 

@@ -114,6 +114,12 @@ bool comm_command_parse_line(const char *line, comm_command_t *out_cmd) {
         out_cmd->value = value;
         return true;
     }
+    // 模式 4 基准脉冲宽度，单位为 ms。取值范围由应用层统一校验。
+    if (parse_key_value(buf, "HTIME", &value)) {
+        out_cmd->type = COMM_COMMAND_HTIME;
+        out_cmd->value = value;
+        return true;
+    }
 
     return false;
 }
